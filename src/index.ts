@@ -165,12 +165,14 @@ function requireIdentity(request: Request, env: Env): (Identity & { email: strin
 
 interface PendingRecord {
 	id: string
-	type: 'upload' | 'delete' | 'move'
+	type: 'upload' | 'delete' | 'move' | 'folder-delete' | 'folder-move'
 	actorEmail: string
 	createdAt: string
 	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number }
 	delete?: { key: string }
 	move?: { oldKey: string; newKey: string }
+	folderDelete?: { folder: string }
+	folderMove?: { sourceFolder: string; destFolder: string }
 }
 
 const PENDING_PREFIX = '_pending/'
@@ -209,6 +211,23 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 	})
 	await env.IMAGES.delete(oldKey)
 	return null
+}
+
+async function listAllImageKeys(env: Env, prefix: string): Promise<string[]> {
+	const keys: string[] = []
+	let cursor: string | undefined
+	do {
+		const page = await env.IMAGES.list({ prefix, limit: 1000, cursor })
+		for (const object of page.objects) {
+			if (IMAGE_KEY_RE.test(object.key))
+				keys.push(object.key)
+		}
+		if (page.truncated)
+			cursor = page.cursor
+		else
+			cursor = undefined
+	} while (cursor)
+	return keys
 }
 
 async function approveRequest(request: Request, env: Env): Promise<Response> {
@@ -263,6 +282,32 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 		const error = record.move.oldKey === record.move.newKey ? null : await moveObject(env, record.move.oldKey, record.move.newKey)
 		if (error)
 			return json({ error }, 404)
+	}
+	else if (record.type === 'folder-delete' && record.folderDelete) {
+		const keys = await listAllImageKeys(env, `${record.folderDelete.folder}/`)
+		for (const key of keys)
+			await env.IMAGES.delete(key)
+	}
+	else if (record.type === 'folder-move' && record.folderMove) {
+		const source = record.folderMove.sourceFolder
+		const dest = record.folderMove.destFolder
+		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
+			return json({ error: '文件夹路径无效' }, 400)
+		if (dest === source || dest.startsWith(source + '/'))
+			return json({ error: '不能移动到自身或其子目录' }, 409)
+		const sourceKeys = await listAllImageKeys(env, `${source}/`)
+		const destKeys = new Set(await listAllImageKeys(env, `${dest}/`))
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			if (destKeys.has(newKey))
+				return json({ error: `目标目录已有 ${newKey}，请先处理冲突` }, 409)
+		}
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const error = await moveObject(env, key, newKey)
+			if (error)
+				return json({ error }, 404)
+		}
 	}
 
 	await env.IMAGES.delete(recordKey)
@@ -340,7 +385,7 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
-	let body: { action?: string; key?: string; oldKey?: string; newKey?: string }
+	let body: { action?: string; key?: string; oldKey?: string; newKey?: string; folder?: string; destFolder?: string }
 	try {
 		body = await request.json() as typeof body
 	}
@@ -363,6 +408,18 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		if (body.oldKey === body.newKey)
 			return json({ error: '新旧路径相同' }, 400)
 		record = { id, type: 'move', actorEmail: identity.email, createdAt, move: { oldKey: body.oldKey, newKey: body.newKey } }
+	}
+	else if (body.action === 'folder-delete') {
+		if (!body.folder || !FOLDER_RE.test(body.folder))
+			return json({ error: '文件夹路径无效' }, 400)
+		record = { id, type: 'folder-delete', actorEmail: identity.email, createdAt, folderDelete: { folder: body.folder } }
+	}
+	else if (body.action === 'folder-move') {
+		if (!body.folder || !body.destFolder || !FOLDER_RE.test(body.folder) || !FOLDER_RE.test(body.destFolder))
+			return json({ error: '文件夹路径无效' }, 400)
+		if (body.folder === body.destFolder)
+			return json({ error: '新旧路径相同' }, 400)
+		record = { id, type: 'folder-move', actorEmail: identity.email, createdAt, folderMove: { sourceFolder: body.folder, destFolder: body.destFolder } }
 	}
 	else {
 		return json({ error: '不支持的操作' }, 400)
@@ -1067,6 +1124,27 @@ function page(request: Request, env: Env): Response {
 			return actions
 		}
 
+		function folderActions(folder) {
+			const actions = document.createElement('div')
+			actions.className = 'drive-actions'
+			const open = document.createElement('button')
+			open.type = 'button'
+			open.textContent = '打开'
+			open.addEventListener('click', () => openDriveFolder(folder))
+			actions.append(open)
+			const move = document.createElement('button')
+			move.type = 'button'
+			move.textContent = '移动'
+			move.addEventListener('click', () => openMoveFolderDialog(folder))
+			actions.append(move)
+			const remove = document.createElement('button')
+			remove.type = 'button'
+			remove.textContent = '删除'
+			remove.addEventListener('click', () => openDeleteFolderDialog(folder))
+			actions.append(remove)
+			return actions
+		}
+
 		function renderFileRow(file) {
 			const row = document.createElement('div')
 			row.className = 'drive-item file'
@@ -1141,7 +1219,10 @@ function page(request: Request, env: Env): Response {
 			title.className = 'title'
 			title.textContent = folder
 			nameBox.append(title)
-			row.append(spacer, icon, nameBox)
+			const size = document.createElement('div')
+			size.className = 'drive-size'
+			const actions = folderActions(folder)
+			row.append(spacer, icon, nameBox, size, actions)
 			row.addEventListener('click', () => openDriveFolder(folder))
 			row.addEventListener('contextmenu', event => {
 				event.preventDefault()
@@ -1204,6 +1285,8 @@ function page(request: Request, env: Env): Response {
 			}
 			else {
 				addButton(driveContext, '打开文件夹', () => { hideDriveContext(); openDriveFolder(target.folder) }).type = 'button'
+				addButton(driveContext, '移动文件夹', () => { hideDriveContext(); openMoveFolderDialog(target.folder) }).type = 'button'
+				addButton(driveContext, '删除文件夹', () => { hideDriveContext(); openDeleteFolderDialog(target.folder) }).type = 'button'
 			}
 			const width = driveContext.offsetWidth || 160
 			driveContext.style.left = Math.min(event.clientX, window.innerWidth - width - 8) + 'px'
@@ -1261,6 +1344,30 @@ function page(request: Request, env: Env): Response {
 					driveSelected.clear()
 					updateDriveSelectionUI()
 					loadDrive(true)
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+		}
+
+		function openDeleteFolderDialog(folder) {
+			const body = document.createElement('div')
+			const warning = document.createElement('p')
+			warning.textContent = '将删除文件夹 ' + folder + ' 下的全部图片（含子目录），owner 批准后才会真正执行。'
+			const note = document.createElement('small')
+			note.textContent = '请确认这些图片在 wiki 文章中已不再使用。'
+			body.append(warning, note)
+			openDialog('申请删除文件夹', body, '提交删除申请', async () => {
+				driveDialogOk.disabled = true
+				try {
+					const result = await apiPost('/api/file', { action: 'folder-delete', folder })
+					driveNoticeMessage('已提交删除文件夹申请：' + result.requestId, false)
+					closeDialog()
 					loadRequests()
 				}
 				catch (error) {
@@ -1353,6 +1460,7 @@ function page(request: Request, env: Env): Response {
 		let movePickerBody = null
 		let moveDestNote = null
 		let moveTargetFiles = []
+		let moveSourceFolder = ''
 
 		function openMoveDialog(files) {
 			moveTargetFiles = files
@@ -1397,6 +1505,45 @@ function page(request: Request, env: Env): Response {
 			renderMoveLevel([])
 		}
 
+		function openMoveFolderDialog(folder) {
+			moveSourceFolder = folder
+			moveTargetFiles = []
+			moveDestination = ''
+			moveLevels = []
+			const body = document.createElement('div')
+			const hint = document.createElement('p')
+			hint.textContent = '将移动文件夹 ' + folder + ' 内的全部图片（含子目录）到：'
+			movePickerBody = document.createElement('div')
+			moveDestNote = document.createElement('p')
+			moveDestNote.className = 'drive-hint'
+			body.append(hint, movePickerBody, moveDestNote)
+			openDialog('申请移动文件夹', body, '提交移动申请', async () => {
+				if (!moveDestination) {
+					alert('请先逐级选择目标文章目录')
+					return
+				}
+				if (moveDestination === moveSourceFolder || moveDestination.startsWith(moveSourceFolder + '/')) {
+					alert('不能移动到自身或其子目录')
+					return
+				}
+				driveDialogOk.disabled = true
+				try {
+					const result = await apiPost('/api/file', { action: 'folder-move', folder: moveSourceFolder, destFolder: moveDestination })
+					driveNoticeMessage('已提交移动文件夹申请：' + result.requestId, false)
+					closeDialog()
+					loadDrive(true)
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+			renderMoveLevel([])
+		}
+
 		function requestDescription(request) {
 			if (request.type === 'upload' && request.upload)
 				return '上传：' + request.upload.originalName + ' → ' + request.upload.finalKey
@@ -1404,6 +1551,10 @@ function page(request: Request, env: Env): Response {
 				return '删除：' + request.delete.key
 			if (request.type === 'move' && request.move)
 				return '移动：' + request.move.oldKey + ' → ' + request.move.newKey
+			if (request.type === 'folder-delete' && request.folderDelete)
+				return '删除文件夹：' + request.folderDelete.folder + '/'
+			if (request.type === 'folder-move' && request.folderMove)
+				return '移动文件夹：' + request.folderMove.sourceFolder + '/ → ' + request.folderMove.destFolder + '/'
 			return '未知操作'
 		}
 
