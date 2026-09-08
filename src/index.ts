@@ -522,6 +522,7 @@ function page(request: Request, env: Env): Response {
 	<title>NCEPUwiki 图片上传</title>
 	<style>
 		:root { color-scheme: light dark; }
+		[hidden] { display: none !important; }
 		body { font-family: system-ui, sans-serif; max-width: 900px; margin: 48px auto; padding: 0 20px; }
 		.card { border: 1px solid #ccc; border-radius: 12px; padding: 24px; }
 		.drop { border: 2px dashed #888; border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; }
