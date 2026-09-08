@@ -2,6 +2,7 @@ export interface Env {
 	IMAGES: R2Bucket
 	IMAGE_BASE_URL: string
 	REQUIRE_AUTH?: string
+	ADMIN_EMAILS?: string
 }
 
 const ALLOWED_TYPES: Record<string, string> = {
@@ -13,6 +14,16 @@ const ALLOWED_TYPES: Record<string, string> = {
 }
 
 const MAX_SIZE = 10 * 1024 * 1024
+const FOLDER_RE = /^(?:\d{1,3}(?:\/\d{1,3})*)?$/
+const IMAGE_KEY_RE = /^(?:\d{1,3}\/)*\d{1,3}\/[^/]+\.(?:jpg|jpeg|png|webp|gif|avif)$/i
+const MIME_BY_EXT: Record<string, string> = {
+	jpg: 'image/jpeg',
+	jpeg: 'image/jpeg',
+	png: 'image/png',
+	webp: 'image/webp',
+	gif: 'image/gif',
+	avif: 'image/avif',
+}
 
 interface Identity {
 	email?: string
@@ -34,6 +45,18 @@ export default {
 
 		if (request.method === 'POST' && url.pathname === '/api/upload')
 			return upload(request, env)
+
+		if (request.method === 'GET' && url.pathname === '/api/files')
+			return listFiles(request, env)
+
+		if (request.method === 'POST' && url.pathname === '/api/file')
+			return fileAction(request, env)
+
+		if (request.method === 'GET' && url.pathname === '/api/requests')
+			return listRequests(request, env)
+
+		if (request.method === 'POST' && url.pathname === '/api/approve')
+			return approveRequest(request, env)
 
 		return json({ error: 'Not Found' }, 404)
 	},
@@ -119,13 +142,240 @@ async function articleOptions(): Promise<string[]> {
 	}
 }
 
-async function upload(request: Request, env: Env): Promise<Response> {
+function adminEmails(env: Env): string[] {
+	return (env.ADMIN_EMAILS || '')
+		.split(',')
+		.map(email => email.trim().toLowerCase())
+		.filter(Boolean)
+}
+
+function isAdminIdentity(email: string | undefined, env: Env): boolean {
+	if (!email)
+		return false
+	const admins = adminEmails(env)
+	return admins.length > 0 && admins.includes(email.toLowerCase())
+}
+
+function requireIdentity(request: Request, env: Env): (Identity & { email: string }) | null {
 	if (isAuthRequired(env) && !request.headers.has('CF-Access-Jwt-Assertion'))
+		return null
+	const identity = identityOf(request)
+	return identity.email ? { email: identity.email, name: identity.name } : null
+}
+
+interface PendingRecord {
+	id: string
+	type: 'upload' | 'delete' | 'move'
+	actorEmail: string
+	createdAt: string
+	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number }
+	delete?: { key: string }
+	move?: { oldKey: string; newKey: string }
+}
+
+const PENDING_PREFIX = '_pending/'
+const validKey = (key: string | undefined): key is string => Boolean(key && IMAGE_KEY_RE.test(key))
+
+function newRequestId(): string {
+	return `${Date.now().toString(36)}-${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`
+}
+
+async function readPending(env: Env, id: string): Promise<PendingRecord | null> {
+	const object = await env.IMAGES.get(`${PENDING_PREFIX}${id}.json`)
+	if (!object)
+		return null
+	const raw = new TextDecoder().decode(await object.arrayBuffer())
+	try {
+		return JSON.parse(raw) as PendingRecord
+	}
+	catch {
+		return null
+	}
+}
+
+async function writePending(env: Env, record: PendingRecord): Promise<void> {
+	await env.IMAGES.put(`${PENDING_PREFIX}${record.id}.json`, JSON.stringify(record), {
+		httpMetadata: { contentType: 'application/json; charset=utf-8' },
+	})
+}
+
+async function moveObject(env: Env, oldKey: string, newKey: string): Promise<string | null> {
+	const source = await env.IMAGES.get(oldKey)
+	if (!source)
+		return '源图片不存在'
+	const extension = newKey.split('.').pop()?.toLowerCase() || ''
+	await env.IMAGES.put(newKey, source.body, {
+		httpMetadata: { contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream' },
+	})
+	await env.IMAGES.delete(oldKey)
+	return null
+}
+
+async function approveRequest(request: Request, env: Env): Promise<Response> {
+	const identity = requireIdentity(request, env)
+	if (!identity)
+		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
+	if (!isAdminIdentity(identity.email, env))
+		return json({ error: '只有 NCEPUwiki owner 可以批准' }, 403)
+
+	let body: { requestId?: string; decision?: string }
+	try {
+		body = await request.json() as typeof body
+	}
+	catch {
+		return json({ error: '请求不是有效的 JSON' }, 400)
+	}
+	if (!body.requestId || !['approve', 'reject'].includes(body.decision || ''))
+		return json({ error: '参数不完整' }, 400)
+
+	const record = await readPending(env, body.requestId)
+	if (!record)
+		return json({ error: '申请不存在或已处理' }, 404)
+	const recordKey = `${PENDING_PREFIX}${record.id}.json`
+
+	if (body.decision === 'reject') {
+		if (record.type === 'upload' && record.upload)
+			await env.IMAGES.delete(record.upload.stagedKey)
+		await env.IMAGES.delete(recordKey)
+		return json({ ok: true, status: 'rejected' })
+	}
+
+	if (record.type === 'upload' && record.upload) {
+		if (await env.IMAGES.head(record.upload.finalKey))
+			return json({ error: '目标位置已有图片，无法重复上传，请改为拒绝' }, 409)
+		const staged = await env.IMAGES.get(record.upload.stagedKey)
+		if (!staged)
+			return json({ error: '待上传的图片数据已丢失' }, 404)
+		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
+		await env.IMAGES.put(record.upload.finalKey, staged.body, {
+			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
+		})
+		await env.IMAGES.delete(record.upload.stagedKey)
+	}
+	else if (record.type === 'delete' && record.delete) {
+		await env.IMAGES.delete(record.delete.key)
+	}
+	else if (record.type === 'move' && record.move) {
+		if (!validKey(record.move.oldKey) || !validKey(record.move.newKey))
+			return json({ error: '申请中的图片路径无效' }, 400)
+		if (record.move.oldKey !== record.move.newKey && await env.IMAGES.head(record.move.newKey))
+			return json({ error: '目标位置已有同名图片，请先处理冲突' }, 409)
+		const error = record.move.oldKey === record.move.newKey ? null : await moveObject(env, record.move.oldKey, record.move.newKey)
+		if (error)
+			return json({ error }, 404)
+	}
+
+	await env.IMAGES.delete(recordKey)
+	return json({ ok: true, status: 'approved' })
+}
+
+async function listRequests(request: Request, env: Env): Promise<Response> {
+	const identity = requireIdentity(request, env)
+	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
-	const identity = identityOf(request)
-	if (isAuthRequired(env) && !identity.email)
-		return json({ error: '无法识别登录身份' }, 401)
+	const mineOnly = new URL(request.url).searchParams.get('mine') === '1'
+	const admin = isAdminIdentity(identity.email, env)
+	const page = await env.IMAGES.list({ prefix: PENDING_PREFIX, delimiter: '/' })
+	const requests: PendingRecord[] = []
+	for (const object of page.objects) {
+		if (!object.key.endsWith('.json'))
+			continue
+		const id = object.key.slice(PENDING_PREFIX.length, -'.json'.length)
+		const record = await readPending(env, id)
+		if (!record)
+			continue
+		if (mineOnly && record.actorEmail.toLowerCase() !== identity.email.toLowerCase())
+			continue
+		if (!mineOnly && !admin && record.actorEmail.toLowerCase() !== identity.email.toLowerCase())
+			continue
+		requests.push(record)
+	}
+	requests.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+	return json({ requests, admin })
+}
+
+async function listFiles(request: Request, env: Env): Promise<Response> {
+	const identity = requireIdentity(request, env)
+	if (!identity)
+		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
+
+	const url = new URL(request.url)
+	const folder = url.searchParams.get('folder') || ''
+	if (!FOLDER_RE.test(folder))
+		return json({ error: '目录格式应为数字编号路径，例如 05/09' }, 400)
+
+	const cursor = url.searchParams.get('cursor') || undefined
+	const prefix = folder ? `${folder}/` : ''
+	const page = await env.IMAGES.list({
+		prefix,
+		delimiter: '/',
+		cursor,
+		include: ['httpMetadata'],
+	})
+	const truncated = page.truncated
+	const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
+	return json({
+		folder,
+		folders: (page.delimitedPrefixes || [])
+			.map(prefixPath => prefixPath.replace(/\/+$/, ''))
+			.filter(folderName => /^\d/.test(folderName)),
+		files: page.objects
+			.filter(object => IMAGE_KEY_RE.test(object.key))
+			.map(object => ({
+				key: object.key,
+				name: object.key.split('/').pop() || object.key,
+				size: object.size,
+				uploaded: object.uploaded.toISOString(),
+				contentType: object.httpMetadata?.contentType || '',
+				url: baseUrl ? `${baseUrl}/${object.key}` : '',
+			})),
+		truncated,
+		cursor: truncated ? page.cursor : '',
+	})
+}
+
+async function fileAction(request: Request, env: Env): Promise<Response> {
+	const identity = requireIdentity(request, env)
+	if (!identity)
+		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
+
+	let body: { action?: string; key?: string; oldKey?: string; newKey?: string }
+	try {
+		body = await request.json() as typeof body
+	}
+	catch {
+		return json({ error: '请求不是有效的 JSON' }, 400)
+	}
+
+	const id = newRequestId()
+	const createdAt = new Date().toISOString()
+	let record: PendingRecord
+
+	if (body.action === 'delete') {
+		if (!validKey(body.key))
+			return json({ error: '无效的图片 key' }, 400)
+		record = { id, type: 'delete', actorEmail: identity.email, createdAt, delete: { key: body.key } }
+	}
+	else if (body.action === 'move') {
+		if (!validKey(body.oldKey) || !validKey(body.newKey))
+			return json({ error: '无效的图片 key' }, 400)
+		if (body.oldKey === body.newKey)
+			return json({ error: '新旧路径相同' }, 400)
+		record = { id, type: 'move', actorEmail: identity.email, createdAt, move: { oldKey: body.oldKey, newKey: body.newKey } }
+	}
+	else {
+		return json({ error: '不支持的操作' }, 400)
+	}
+
+	await writePending(env, record)
+	return json({ ok: true, status: 'pending', requestId: id })
+}
+
+async function upload(request: Request, env: Env): Promise<Response> {
+	const identity = requireIdentity(request, env)
+	if (!identity)
+		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
 	let form: FormData
 	try {
@@ -157,19 +407,34 @@ async function upload(request: Request, env: Env): Promise<Response> {
 	const bytes = await file.arrayBuffer()
 	const digest = await crypto.subtle.digest('SHA-256', bytes)
 	const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 16)
-	const key = `${folder}/${hash}.${extension}`
-	const existing = await env.IMAGES.head(key)
+	const finalKey = `${folder}/${hash}.${extension}`
+	const existing = await env.IMAGES.head(finalKey)
+	const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
 
-	if (!existing)
-		await env.IMAGES.put(key, bytes, { httpMetadata: { contentType: file.type } })
+	if (existing) {
+		return json({
+			status: 'exists',
+			duplicate: true,
+			url: `${baseUrl}/${finalKey}`,
+			key: finalKey,
+		})
+	}
 
-	const baseUrl = env.IMAGE_BASE_URL.replace(/\/+$/, '')
-	const url = `${baseUrl}/${key}`
-
+	const id = newRequestId()
+	const stagedKey = `${PENDING_PREFIX}${id}/${hash}.${extension}`
+	await env.IMAGES.put(stagedKey, bytes, { httpMetadata: { contentType: file.type } })
+	const record: PendingRecord = {
+		id,
+		type: 'upload',
+		actorEmail: identity.email,
+		createdAt: new Date().toISOString(),
+		upload: { stagedKey, finalKey, originalName: file.name, size: file.size },
+	}
+	await writePending(env, record)
 	return json({
-		url,
-		key,
-		duplicate: Boolean(existing),
+		status: 'pending',
+		requestId: id,
+		message: '图片已提交，等待 owner 批准后才会公开',
 	})
 }
 
@@ -203,6 +468,28 @@ function articleFolder(input: string): string | null {
 function page(request: Request, env: Env): Response {
 	const identity = identityOf(request)
 	const email = identity.email ? `<span id="email">${escapeHtml(identity.email)}</span>` : '<span id="email">未登录（尚未启用 Access）</span>'
+	const isAdmin = isAdminIdentity(identity.email, env)
+	const managementCard = `
+	<div class="card">
+		<h2>修改已有图片（移动 / 重命名 / 删除）</h2>
+		<p>任何登录用户都可以提交申请，只有 NCEPUwiki owner 批准后才会真正执行。</p>
+		<p><label>目录编号（留空浏览全部）：<input id="manageFolder" type="text" placeholder="例如 05/09"></label>
+		<button type="button" id="manageListBtn">列出</button></p>
+		<div id="managePath"></div>
+		<div id="manageList"></div>
+		<p id="manageMoreWrap" hidden><button type="button" id="manageMore">加载更多</button></p>
+	</div>
+	<div class="card">
+		<h2>我的申请</h2>
+		<div id="myReqList"></div>
+		<p><button type="button" id="myReqRefresh">刷新</button></p>
+	</div>`
+	const approvalCard = isAdmin ? `
+	<div class="card">
+		<h2>待批准（owner）</h2>
+		<div id="approvalList"></div>
+		<p><button type="button" id="approvalRefresh">刷新</button></p>
+	</div>` : ''
 	return new Response(`<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -253,10 +540,11 @@ function page(request: Request, env: Env): Response {
 		<button id="upload">上传</button>
 		<div class="msg" id="msg"></div>
 		<div class="result" id="result" hidden>
-			<p><strong>上传结果（直接复制图片链接）：</strong></p>
+			<p><strong>上传结果（批准后才能得到公开链接）：</strong></p>
 			<div id="resultList"></div>
 		</div>
 	</div>
+	${managementCard}${approvalCard}
 	<script type="module">
 		const drop = document.querySelector('#drop')
 		const fileInput = document.querySelector('#fileInput')
@@ -272,11 +560,24 @@ function page(request: Request, env: Env): Response {
 		const msg = document.querySelector('#msg')
 		const result = document.querySelector('#result')
 		const resultList = document.querySelector('#resultList')
+		const manageFolderInput = document.querySelector('#manageFolder')
+		const manageListBtn = document.querySelector('#manageListBtn')
+		const managePath = document.querySelector('#managePath')
+		const manageList = document.querySelector('#manageList')
+		const manageMoreWrap = document.querySelector('#manageMoreWrap')
+		const manageMore = document.querySelector('#manageMore')
+		const myReqList = document.querySelector('#myReqList')
+		const myReqRefresh = document.querySelector('#myReqRefresh')
+		const approvalList = document.querySelector('#approvalList')
+		const approvalRefresh = document.querySelector('#approvalRefresh')
 
 		let pendingFiles = []
 		let allArticles = []
 		let articleValue = ''
 		let levelState = []
+		let manageFolder = ''
+		let manageCursor = ''
+		let manageLoading = false
 
 		function isImage(file) {
 			return ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'].includes(file.type)
@@ -507,7 +808,7 @@ function page(request: Request, env: Env): Response {
 			uploadButton.disabled = true
 			result.hidden = false
 			resultList.textContent = ''
-			let successCount = 0
+			let pendingCount = 0
 			let duplicateCount = 0
 			let failedCount = 0
 			for (let index = 0; index < pendingFiles.length; index++) {
@@ -523,20 +824,28 @@ function page(request: Request, env: Env): Response {
 					const data = await response.json()
 					if (!response.ok)
 						throw new Error(data.error || '上传失败')
-					item.url.value = data.url
-					item.note.textContent = data.duplicate ? '已存在相同图片，直接复用链接' : '上传成功'
-					item.note.className = 'ok'
-					if (data.duplicate)
+					if (data.status === 'pending') {
+						pendingCount++
+						item.url.value = '等待 owner 批准…'
+						item.note.textContent = '已提交申请（' + data.requestId + '），批准后公开'
+						item.note.className = 'ok'
+					}
+					else if (data.status === 'exists') {
 						duplicateCount++
-					else
-						successCount++
-					const preview = document.createElement('a')
-					preview.href = data.url
-					preview.target = '_blank'
-					preview.rel = 'noopener'
-					preview.textContent = '预览 ↗'
-					item.actions.append(preview)
-					appendCopyButton(item.actions, item.url)
+						item.url.value = data.url
+						item.note.textContent = '图片已存在，链接可直接使用'
+						item.note.className = 'ok'
+						const preview = document.createElement('a')
+						preview.href = data.url
+						preview.target = '_blank'
+						preview.rel = 'noopener'
+						preview.textContent = '预览 ↗'
+						item.actions.append(preview)
+						appendCopyButton(item.actions, item.url)
+					}
+					else {
+						throw new Error('未知上传状态')
+					}
 				}
 				catch (error) {
 					failedCount++
@@ -548,15 +857,264 @@ function page(request: Request, env: Env): Response {
 			}
 			uploadButton.disabled = false
 			const summary = []
-			if (successCount)
-				summary.push(successCount + ' 张新上传')
+			if (pendingCount)
+				summary.push(pendingCount + ' 张已提交审批')
 			if (duplicateCount)
 				summary.push(duplicateCount + ' 张已存在复用')
 			if (failedCount)
 				summary.push(failedCount + ' 张失败')
 			msg.textContent = '完成：' + summary.join('，') + '。'
 			msg.className = failedCount ? 'msg error' : 'msg ok'
+			if (pendingCount)
+				loadRequests()
 		})
+
+		function formatBytes(bytes) {
+			if (!bytes && bytes !== 0)
+				return ''
+			if (bytes < 1024)
+				return bytes + ' B'
+			if (bytes < 1024 * 1024)
+				return (bytes / 1024).toFixed(1) + ' KB'
+			return (bytes / 1024 / 1024).toFixed(2) + ' MB'
+		}
+
+		async function apiGet(path) {
+			const response = await fetch(path)
+			const data = await response.json()
+			if (!response.ok)
+				throw new Error(data.error || '请求失败')
+			return data
+		}
+
+		async function apiPost(path, payload) {
+			const response = await fetch(path, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload),
+			})
+			const data = await response.json()
+			if (!response.ok)
+				throw new Error(data.error || '请求失败')
+			return data
+		}
+
+		function addButton(parent, text, handler) {
+			const button = document.createElement('button')
+			button.type = 'button'
+			button.textContent = text
+			button.addEventListener('click', handler)
+			parent.append(button)
+			return button
+		}
+
+		async function loadManage(reset) {
+			if (!manageListBtn || manageLoading)
+				return
+			const raw = manageFolderInput.value.trim()
+			if (raw && !/^\\d{1,3}(?:\\/\\d{1,3})*$/.test(raw)) {
+				alert('目录格式应为数字编号路径，例如 05/09')
+				return
+			}
+			if (reset) {
+				manageFolder = raw
+				manageCursor = ''
+			}
+			if (!reset && !manageCursor)
+				return
+			manageLoading = true
+			manageListBtn.disabled = true
+			manageListBtn.textContent = '加载中…'
+			try {
+				let url = '/api/files?folder=' + encodeURIComponent(manageFolder)
+				if (manageCursor)
+					url += '&cursor=' + encodeURIComponent(manageCursor)
+				const data = await apiGet(url)
+				if (reset)
+					manageList.textContent = ''
+				managePath.textContent = manageFolder ? '当前目录：' + manageFolder : '根目录（一级栏目）'
+
+				for (const folder of data.folders || []) {
+					const row = document.createElement('div')
+					row.className = 'result-item'
+					const button = addButton(row, '📁 ' + folder, () => {
+						manageFolderInput.value = folder
+						loadManage(true)
+					})
+					button.style.width = '100%'
+					manageList.append(row)
+				}
+
+				for (const file of data.files || []) {
+					const row = document.createElement('div')
+					row.className = 'result-item'
+					const head = document.createElement('div')
+					head.textContent = file.name + '（' + formatBytes(file.size) + '）'
+					const url = document.createElement('input')
+					url.className = 'row-url'
+					url.readOnly = true
+					url.value = file.url || ''
+					const actions = document.createElement('div')
+					actions.className = 'row-actions'
+					row.append(head, url, actions)
+					manageList.append(row)
+
+					if (file.url) {
+						const preview = document.createElement('a')
+						preview.href = file.url
+						preview.target = '_blank'
+						preview.rel = 'noopener'
+						preview.textContent = '预览 ↗'
+						actions.append(preview)
+						appendCopyButton(actions, url)
+					}
+
+					const parent = file.key.slice(0, file.key.lastIndexOf('/'))
+					addButton(actions, '申请重命名', async () => {
+						const newName = prompt('输入新文件名（保留扩展名）', file.name)
+						if (!newName || newName === file.name)
+							return
+						if (newName.includes('/') || newName.includes('\\\\') || !/\\.(?:jpg|jpeg|png|webp|gif|avif)$/i.test(newName)) {
+							alert('文件名格式不正确')
+							return
+						}
+						try {
+							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent + '/' + newName })
+							alert('已提交申请：' + result.requestId)
+							loadRequests()
+						}
+						catch (error) {
+							alert(error.message)
+						}
+					})
+					addButton(actions, '申请移动', async () => {
+						const target = prompt('输入目标目录编号（例如 05/10）', parent)
+						if (!target || target === parent)
+							return
+						if (!/^\\d{1,3}(?:\\/\\d{1,3})*$/.test(target.trim())) {
+							alert('目录格式应为数字编号路径')
+							return
+						}
+						try {
+							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: target.trim() + '/' + file.name })
+							alert('已提交申请：' + result.requestId)
+							loadRequests()
+						}
+						catch (error) {
+							alert(error.message)
+						}
+					})
+					addButton(actions, '申请删除', async () => {
+						if (!confirm('确认提交删除 ' + file.key + ' 的申请吗？'))
+							return
+						try {
+							const result = await apiPost('/api/file', { action: 'delete', key: file.key })
+							alert('已提交申请：' + result.requestId)
+							loadRequests()
+						}
+						catch (error) {
+							alert(error.message)
+						}
+					})
+				}
+
+				manageMoreWrap.hidden = !data.truncated
+				manageCursor = data.truncated ? data.cursor : ''
+			}
+			catch (error) {
+				alert(error.message || '列表加载失败')
+			}
+			finally {
+				manageLoading = false
+				manageListBtn.disabled = false
+				manageListBtn.textContent = '列出'
+			}
+		}
+
+		function requestDescription(request) {
+			if (request.type === 'upload' && request.upload)
+				return '上传：' + request.upload.originalName + ' → ' + request.upload.finalKey
+			if (request.type === 'delete' && request.delete)
+				return '删除：' + request.delete.key
+			if (request.type === 'move' && request.move)
+				return '移动：' + request.move.oldKey + ' → ' + request.move.newKey
+			return '未知操作'
+		}
+
+		function appendRequestRow(container, request, allowAction) {
+			const row = document.createElement('div')
+			row.className = 'result-item'
+			const head = document.createElement('div')
+			head.textContent = '#' + request.id + '  ' + requestDescription(request)
+			const meta = document.createElement('small')
+			meta.textContent = '申请人：' + request.actorEmail + '　时间：' + new Date(request.createdAt).toLocaleString()
+			row.append(head, meta)
+			if (allowAction) {
+				const actions = document.createElement('div')
+				actions.className = 'row-actions'
+				addButton(actions, '批准', async () => {
+					try {
+						await apiPost('/api/approve', { requestId: request.id, decision: 'approve' })
+						alert('已批准')
+						loadRequests()
+					}
+					catch (error) {
+						alert(error.message)
+					}
+				})
+				addButton(actions, '拒绝', async () => {
+					try {
+						await apiPost('/api/approve', { requestId: request.id, decision: 'reject' })
+						alert('已拒绝')
+						loadRequests()
+					}
+					catch (error) {
+						alert(error.message)
+					}
+				})
+				row.append(actions)
+			}
+			container.append(row)
+		}
+
+		async function loadRequests() {
+			try {
+				const mine = await apiGet('/api/requests?mine=1')
+				myReqList.textContent = ''
+				if (!mine.requests.length)
+					myReqList.append(Object.assign(document.createElement('p'), { textContent: '暂无待处理的申请' }))
+				for (const request of mine.requests)
+					appendRequestRow(myReqList, request, false)
+
+				if (approvalList) {
+					const all = await apiGet('/api/requests')
+					approvalList.textContent = ''
+					if (!all.requests.length)
+						approvalList.append(Object.assign(document.createElement('p'), { textContent: '暂无待批准的申请' }))
+					for (const request of all.requests)
+						appendRequestRow(approvalList, request, true)
+				}
+			}
+			catch (error) {
+				alert(error.message || '申请列表加载失败')
+			}
+		}
+
+		if (manageListBtn) {
+			manageListBtn.addEventListener('click', () => loadManage(true))
+			manageMore.addEventListener('click', () => loadManage(false))
+			manageFolderInput.addEventListener('keydown', event => {
+				if (event.key === 'Enter')
+					loadManage(true)
+			})
+		}
+		if (myReqRefresh)
+			myReqRefresh.addEventListener('click', loadRequests)
+		if (approvalRefresh)
+			approvalRefresh.addEventListener('click', loadRequests)
+		if (manageListBtn)
+			loadManage(true)
+		loadRequests()
 	</script>
 </body>
 </html>`, {

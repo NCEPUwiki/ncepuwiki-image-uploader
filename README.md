@@ -1,26 +1,28 @@
 # NCEPUwiki 图片上传器
 
-普通编辑者无需接触 Cloudflare/R2，只需打开上传页、登录、选择图片/文件夹并复制返回的图片链接。
+任何能登录页面的用户都可以选择图片/文件夹、提交上传或修改申请；**所有修改 R2 的操作都要等 owner 批准后才真正执行**。批准后公开的图片链接可直接复制使用。
 
-上传只把图片存入 R2，**不会修改 wiki 仓库中的任何 Markdown 文件**。
+本工具只操作 R2 图片，**不会修改 wiki 仓库中的任何 Markdown 文件**。
 
 ## 主要文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/index.ts` | 上传器全部代码：页面 UI、上传接口、SHA-256 去重、按文章编号分层存 R2 |
-| `wrangler.toml` | Cloudflare Worker 配置：R2 桶绑定、`IMAGE_BASE_URL`、`REQUIRE_AUTH` |
+| `src/index.ts` | 上传器全部代码：页面 UI、申请/审批接口、SHA-256 去重、按文章编号分层存 R2 |
+| `wrangler.toml` | Cloudflare Worker 配置：R2 桶绑定、`IMAGE_BASE_URL`、`REQUIRE_AUTH`、`ADMIN_EMAILS` |
 | `package.json` | 常用命令（`pnpm dev` / `pnpm typecheck` / `pnpm run deploy:worker`） |
 | `README.md` | 本文档 |
 
-## 当前能力（第二步）
+## 当前能力
 
 - 限制常见图片格式与大小
 - 用文件内容 SHA-256 去重，避免同一张图重复占用空间
 - 支持一次选择多张图片、或选择整个文件夹（只取文件夹内的图片，不创建空目录/不上传其他文件）
 - 支持拖拽与粘贴上传
 - 图片按文章编号分层存放：上传页从 GitHub 仓库自动加载文章目录，按“栏目 → 子栏目 → 文章”逐级下拉选择；尚未推送的新文章可手动输入路径。Worker 自动提取每层数字编号（`docs/05.校园生活/09.美食.md` → `05/09`）作为目录，与仓库 `docs/public/img/` 的分层规则一致
-- 每个上传结果下方直接给出可复制的图片链接与预览入口
+- 上传、删除、移动、重命名都以“申请”形式提交，暂存于 R2 的 `_pending/` 隐藏前缀下
+- 只有 `wrangler.toml` 中 `ADMIN_EMAILS` 列出的 owner 能在页面上批准/拒绝
+- 批准后图片才真正写入最终路径；申请人的“我的申请”与 owner 的“待批准”列表都在同一页面
 
 例：文章 `docs/03.计算机知识专题/08.踏入AI高阶之路.md` 上传的图片会存为
 `https://img.ncepuinfo.cc/03/08/<hash>.webp`。
@@ -33,13 +35,14 @@
 2. 改页面按钮、提示文字、上传结果展示 → 编辑 `src/index.ts` 里的 `page()`（HTML 字符串）。
 3. 改上传限制、去重、分层存储逻辑 → 编辑 `src/index.ts` 里的 `upload()`。
 4. 改 R2 桶 / 图片域名 / 是否需要登录 → 编辑 `wrangler.toml`。
-5. 在项目根目录打开终端，先做类型检查：
+5. 改可批准申请的 owner 邮箱 → 编辑 `wrangler.toml` 的 `ADMIN_EMAILS`（多个用英文逗号分隔）。
+6. 在项目根目录打开终端，先做类型检查：
 
    ```bash
    pnpm typecheck
    ```
 
-6. 发布到 Cloudflare（会直接替换线上 Worker，无需再进控制台）：
+7. 发布到 Cloudflare（会直接替换线上 Worker，无需再进控制台）：
 
    ```bash
    pnpm run deploy:worker
@@ -56,6 +59,7 @@
 1. `bucket_name` / `preview_bucket_name`：改成你的真实 R2 桶名（示例 `ncepuwiki-image`）。
 2. `IMAGE_BASE_URL`：改成图片公开域名（示例 `https://img.ncepuinfo.cc`）。
 3. `REQUIRE_AUTH`：套上 Cloudflare Access 之前保持 `"false"`，配置好后再改成 `"true"`。
+4. `ADMIN_EMAILS`：填写 NCEPUwiki GitHub 组织 owner 的登录邮箱（例如 `1361942776@qq.com`），只有这些邮箱能批准图片修改。
 
 R2 桶需先在 Cloudflare 控制台绑定 `img.ncepuinfo.cc` 之类的自定义域名，上传 URL 才能公开访问。
 
