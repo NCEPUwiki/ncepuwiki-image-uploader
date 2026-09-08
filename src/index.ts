@@ -471,19 +471,43 @@ function page(request: Request, env: Env): Response {
 	const isAdmin = isAdminIdentity(identity.email, env)
 	const managementCard = `
 	<div class="card">
-		<h2>修改已有图片（移动 / 重命名 / 删除）</h2>
-		<p>任何登录用户都可以提交申请，只有 NCEPUwiki owner 批准后才会真正执行。</p>
-		<p><label>目录编号（留空浏览全部）：<input id="manageFolder" type="text" placeholder="例如 05/09"></label>
-		<button type="button" id="manageListBtn">列出</button></p>
-		<div id="managePath"></div>
-		<div id="manageList"></div>
-		<p id="manageMoreWrap" hidden><button type="button" id="manageMore">加载更多</button></p>
+		<h2>图片库</h2>
+		<p class="drive-hint">点目录进入浏览；移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
+		<div class="drive-toolbar">
+			<button type="button" id="driveUp">↑ 返回上级</button>
+			<div id="driveCrumbs" class="drive-crumbs"></div>
+			<span class="drive-spacer"></span>
+			<button type="button" id="driveSelectAll">全选本页</button>
+			<button type="button" id="driveRefresh">刷新</button>
+		</div>
+		<div id="driveSelection" class="drive-selection" hidden>
+			已选 <strong id="driveSelectedCount">0</strong> 项
+			<button type="button" id="driveBatchDelete">申请删除</button>
+			<button type="button" id="driveBatchMove">申请移动</button>
+			<button type="button" id="driveClearSelection">取消选择</button>
+		</div>
+		<div id="driveList" class="drive-list"></div>
+		<p id="driveEmpty" class="drive-empty" hidden>这个目录还没有图片</p>
+		<p id="driveMoreWrap" hidden><button type="button" id="driveMore">加载更多</button></p>
+		<p id="driveNotice" class="msg"></p>
 	</div>
 	<div class="card">
 		<h2>我的申请</h2>
 		<div id="myReqList"></div>
 		<p><button type="button" id="myReqRefresh">刷新</button></p>
 	</div>`
+	const dialogMarkup = `
+	<div id="driveDialog" class="modal-mask" hidden>
+		<div class="modal" role="dialog" aria-modal="true">
+			<h3 id="driveDialogTitle"></h3>
+			<div id="driveDialogBody"></div>
+			<div class="modal-actions">
+				<button type="button" id="driveDialogCancel">取消</button>
+				<button type="button" id="driveDialogOk" class="primary">确定</button>
+			</div>
+		</div>
+	</div>
+	<div id="driveContext" class="context-menu" hidden></div>`
 	const approvalCard = isAdmin ? `
 	<div class="card">
 		<h2>待批准（owner）</h2>
@@ -498,7 +522,7 @@ function page(request: Request, env: Env): Response {
 	<title>NCEPUwiki 图片上传</title>
 	<style>
 		:root { color-scheme: light dark; }
-		body { font-family: system-ui, sans-serif; max-width: 680px; margin: 48px auto; padding: 0 20px; }
+		body { font-family: system-ui, sans-serif; max-width: 900px; margin: 48px auto; padding: 0 20px; }
 		.card { border: 1px solid #ccc; border-radius: 12px; padding: 24px; }
 		.drop { border: 2px dashed #888; border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; }
 		.drop.over { border-color: #1d6fff; background: #1d6fff14; }
@@ -514,6 +538,39 @@ function page(request: Request, env: Env): Response {
 		.article-level { margin: 6px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 		.article-level .level-label { color: #888; font-size: 13px; }
 		.level-select { max-width: 100%; }
+		.drive-hint { color: #666; font-size: 13px; }
+		.drive-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+		.drive-crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 13px; }
+		.drive-crumbs button { border: none; background: transparent; padding: 4px 6px; border-radius: 6px; color: #1d6fff; }
+		.drive-crumbs button:hover { background: #00000012; }
+		.drive-spacer { flex: 1; }
+		.drive-selection { background: #eef5ff; border: 1px solid #bcd6ff; border-radius: 8px; padding: 6px 10px; margin: 6px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+		.drive-list { border: 1px solid #eee; border-radius: 8px; overflow: hidden; }
+		.drive-item { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-bottom: 1px solid #f1f1f1; cursor: default; }
+		.drive-item:last-child { border-bottom: none; }
+		.drive-item:hover { background: #f7f9fc; }
+		.drive-item.selected { background: #e8f1ff; }
+		.drive-item.folder { cursor: pointer; }
+		.drive-item.folder:hover { background: #f0f6ff; }
+		.drive-thumb { width: 42px; height: 42px; border-radius: 6px; object-fit: cover; background: #f0f0f0; flex: none; }
+		.drive-icon { font-size: 26px; width: 42px; text-align: center; flex: none; line-height: 42px; }
+		.drive-name { flex: 1; min-width: 0; }
+		.drive-name .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.drive-name .meta { color: #888; font-size: 12px; }
+		.drive-size { color: #888; font-size: 12px; flex: none; width: 70px; text-align: right; }
+		.drive-actions { flex: none; display: flex; gap: 4px; opacity: 0; transition: opacity .15s; }
+		.drive-item:hover .drive-actions, .drive-item:focus-within .drive-actions { opacity: 1; }
+		.drive-actions button, .drive-actions a { border: none; background: transparent; color: #1d6fff; padding: 4px 7px; border-radius: 6px; text-decoration: none; font-size: 13px; }
+		.drive-actions button:hover, .drive-actions a:hover { background: #1d6fff1f; }
+		.drive-empty { color: #888; text-align: center; padding: 26px 0; }
+		.modal-mask { position: fixed; inset: 0; background: #00000066; display: flex; align-items: center; justify-content: center; z-index: 30; }
+		.modal { background: #fff; color: #111; border-radius: 10px; padding: 18px 20px; width: min(92vw, 520px); max-height: 84vh; overflow: auto; box-shadow: 0 16px 40px #0003; }
+		.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+		.modal-actions button { padding: 6px 16px; border-radius: 7px; border: 1px solid #ccc; background: #fff; }
+		.modal-actions button.primary { background: #1d6fff; border-color: #1d6fff; color: #fff; }
+		.context-menu { position: fixed; z-index: 40; background: #fff; color: #111; border: 1px solid #ddd; border-radius: 8px; box-shadow: 0 8px 24px #0003; min-width: 150px; padding: 4px; }
+		.context-menu button { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 7px 10px; border-radius: 5px; }
+		.context-menu button:hover { background: #f0f0f0; }
 	</style>
 </head>
 <body>
@@ -544,7 +601,7 @@ function page(request: Request, env: Env): Response {
 			<div id="resultList"></div>
 		</div>
 	</div>
-	${managementCard}${approvalCard}
+	${managementCard}${approvalCard}${dialogMarkup}
 	<script type="module">
 		const drop = document.querySelector('#drop')
 		const fileInput = document.querySelector('#fileInput')
@@ -560,12 +617,26 @@ function page(request: Request, env: Env): Response {
 		const msg = document.querySelector('#msg')
 		const result = document.querySelector('#result')
 		const resultList = document.querySelector('#resultList')
-		const manageFolderInput = document.querySelector('#manageFolder')
-		const manageListBtn = document.querySelector('#manageListBtn')
-		const managePath = document.querySelector('#managePath')
-		const manageList = document.querySelector('#manageList')
-		const manageMoreWrap = document.querySelector('#manageMoreWrap')
-		const manageMore = document.querySelector('#manageMore')
+		const driveList = document.querySelector('#driveList')
+		const driveCrumbs = document.querySelector('#driveCrumbs')
+		const driveUp = document.querySelector('#driveUp')
+		const driveRefresh = document.querySelector('#driveRefresh')
+		const driveSelectAll = document.querySelector('#driveSelectAll')
+		const driveSelection = document.querySelector('#driveSelection')
+		const driveSelectedCount = document.querySelector('#driveSelectedCount')
+		const driveBatchDelete = document.querySelector('#driveBatchDelete')
+		const driveBatchMove = document.querySelector('#driveBatchMove')
+		const driveClearSelection = document.querySelector('#driveClearSelection')
+		const driveEmpty = document.querySelector('#driveEmpty')
+		const driveMoreWrap = document.querySelector('#driveMoreWrap')
+		const driveMore = document.querySelector('#driveMore')
+		const driveNotice = document.querySelector('#driveNotice')
+		const driveDialog = document.querySelector('#driveDialog')
+		const driveDialogTitle = document.querySelector('#driveDialogTitle')
+		const driveDialogBody = document.querySelector('#driveDialogBody')
+		const driveDialogOk = document.querySelector('#driveDialogOk')
+		const driveDialogCancel = document.querySelector('#driveDialogCancel')
+		const driveContext = document.querySelector('#driveContext')
 		const myReqList = document.querySelector('#myReqList')
 		const myReqRefresh = document.querySelector('#myReqRefresh')
 		const approvalList = document.querySelector('#approvalList')
@@ -575,9 +646,11 @@ function page(request: Request, env: Env): Response {
 		let allArticles = []
 		let articleValue = ''
 		let levelState = []
-		let manageFolder = ''
-		let manageCursor = ''
-		let manageLoading = false
+		let driveFolder = ''
+		let driveCursor = ''
+		let driveLoading = false
+		let drivePageFiles = []
+		let driveSelected = new Map()
 
 		function isImage(file) {
 			return ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'].includes(file.type)
@@ -908,127 +981,419 @@ function page(request: Request, env: Env): Response {
 			return button
 		}
 
-		async function loadManage(reset) {
-			if (!manageListBtn || manageLoading)
-				return
-			const raw = manageFolderInput.value.trim()
-			if (raw && !/^\\d{1,3}(?:\\/\\d{1,3})*$/.test(raw)) {
-				alert('目录格式应为数字编号路径，例如 05/09')
-				return
+		function driveNoticeMessage(text, isError) {
+			driveNotice.textContent = text
+			driveNotice.className = isError ? 'msg error' : 'msg ok'
+		}
+
+		function updateDriveSelectionUI() {
+			driveSelection.hidden = driveSelected.size === 0
+			driveSelectedCount.textContent = String(driveSelected.size)
+		}
+
+		function toggleFileSelection(file, row, checkbox) {
+			if (driveSelected.has(file.key))
+				driveSelected.delete(file.key)
+			else
+				driveSelected.set(file.key, file)
+			if (row)
+				row.classList.toggle('selected', driveSelected.has(file.key))
+			if (checkbox)
+				checkbox.checked = driveSelected.has(file.key)
+			updateDriveSelectionUI()
+		}
+
+		function renderCrumbs() {
+			driveCrumbs.textContent = ''
+			const parts = driveFolder ? driveFolder.split('/') : []
+			const root = document.createElement('button')
+			root.type = 'button'
+			root.textContent = '全部'
+			root.addEventListener('click', () => openDriveFolder(''))
+			driveCrumbs.append(root)
+			let prefix = ''
+			for (const part of parts) {
+				prefix = prefix ? prefix + '/' + part : part
+				const crumb = document.createElement('button')
+				crumb.type = 'button'
+				crumb.textContent = part
+				crumb.addEventListener('click', () => openDriveFolder(prefix))
+				driveCrumbs.append(document.createTextNode(' / '), crumb)
 			}
-			if (reset) {
-				manageFolder = raw
-				manageCursor = ''
-			}
-			if (!reset && !manageCursor)
+			driveUp.disabled = !driveFolder
+		}
+
+		function openDriveFolder(folder) {
+			driveFolder = folder
+			driveCursor = ''
+			drivePageFiles = []
+			driveSelected.clear()
+			updateDriveSelectionUI()
+			loadDrive(true)
+		}
+
+		function fileActions(file, row) {
+			const actions = document.createElement('div')
+			actions.className = 'drive-actions'
+
+			const copy = document.createElement('button')
+			copy.type = 'button'
+			copy.textContent = '复制链接'
+			copy.addEventListener('click', async () => {
+				await navigator.clipboard.writeText(file.url || '')
+				copy.textContent = '已复制'
+				setTimeout(() => { copy.textContent = '复制链接' }, 1500)
+			})
+			actions.append(copy)
+
+			const rename = document.createElement('button')
+			rename.type = 'button'
+			rename.textContent = '重命名'
+			rename.addEventListener('click', () => openRenameDialog(file))
+			actions.append(rename)
+
+			const move = document.createElement('button')
+			move.type = 'button'
+			move.textContent = '移动'
+			move.addEventListener('click', () => openMoveDialog([file]))
+			actions.append(move)
+
+			const remove = document.createElement('button')
+			remove.type = 'button'
+			remove.textContent = '删除'
+			remove.addEventListener('click', () => openDeleteDialog([file]))
+			actions.append(remove)
+			return actions
+		}
+
+		function renderFileRow(file) {
+			const row = document.createElement('div')
+			row.className = 'drive-item file'
+			row.dataset.key = file.key
+
+			const checkbox = document.createElement('input')
+			checkbox.type = 'checkbox'
+			checkbox.className = 'drive-check'
+			checkbox.checked = driveSelected.has(file.key)
+			checkbox.addEventListener('click', event => {
+				event.stopPropagation()
+				toggleFileSelection(file, row, checkbox)
+			})
+
+			const thumb = document.createElement('img')
+			thumb.className = 'drive-thumb'
+			thumb.loading = 'lazy'
+			thumb.alt = ''
+			if (file.url)
+				thumb.src = file.url
+			thumb.addEventListener('error', () => {
+				thumb.remove()
+				const icon = document.createElement('div')
+				icon.className = 'drive-icon'
+				icon.textContent = '🖼'
+				row.insertBefore(icon, row.children[1] || null)
+			})
+
+			const nameBox = document.createElement('div')
+			nameBox.className = 'drive-name'
+			const title = document.createElement('div')
+			title.className = 'title'
+			title.textContent = file.name
+			const meta = document.createElement('div')
+			meta.className = 'meta'
+			meta.textContent = file.uploaded ? new Date(file.uploaded).toLocaleString() : ''
+			nameBox.append(title, meta)
+
+			const size = document.createElement('div')
+			size.className = 'drive-size'
+			size.textContent = formatBytes(file.size)
+
+			const actions = fileActions(file, row)
+			row.append(checkbox, thumb, nameBox, size, actions)
+			row.addEventListener('click', () => toggleFileSelection(file, row, checkbox))
+			row.addEventListener('dblclick', () => {
+				if (file.url)
+					window.open(file.url, '_blank')
+			})
+			row.addEventListener('contextmenu', event => {
+				event.preventDefault()
+				event.stopPropagation()
+				showDriveContext(event, file)
+			})
+			driveList.append(row)
+		}
+
+		function renderFolderRow(folder) {
+			const row = document.createElement('div')
+			row.className = 'drive-item folder'
+			row.dataset.folder = folder
+			const spacer = document.createElement('input')
+			spacer.type = 'checkbox'
+			spacer.tabIndex = -1
+			spacer.disabled = true
+			const icon = document.createElement('div')
+			icon.className = 'drive-icon'
+			icon.textContent = '📁'
+			const nameBox = document.createElement('div')
+			nameBox.className = 'drive-name'
+			const title = document.createElement('div')
+			title.className = 'title'
+			title.textContent = folder
+			nameBox.append(title)
+			row.append(spacer, icon, nameBox)
+			row.addEventListener('click', () => openDriveFolder(folder))
+			row.addEventListener('contextmenu', event => {
+				event.preventDefault()
+				event.stopPropagation()
+				showDriveContext(event, { folder })
+			})
+			driveList.append(row)
+		}
+
+		async function loadDrive(reset) {
+			if (driveLoading)
 				return
-			manageLoading = true
-			manageListBtn.disabled = true
-			manageListBtn.textContent = '加载中…'
+			if (!reset && !driveCursor)
+				return
+			driveLoading = true
+			driveRefresh.disabled = true
+			driveRefresh.textContent = '加载中…'
 			try {
-				let url = '/api/files?folder=' + encodeURIComponent(manageFolder)
-				if (manageCursor)
-					url += '&cursor=' + encodeURIComponent(manageCursor)
+				let url = '/api/files?folder=' + encodeURIComponent(driveFolder)
+				if (!reset && driveCursor)
+					url += '&cursor=' + encodeURIComponent(driveCursor)
 				const data = await apiGet(url)
-				if (reset)
-					manageList.textContent = ''
-				managePath.textContent = manageFolder ? '当前目录：' + manageFolder : '根目录（一级栏目）'
-
-				for (const folder of data.folders || []) {
-					const row = document.createElement('div')
-					row.className = 'result-item'
-					const button = addButton(row, '📁 ' + folder, () => {
-						manageFolderInput.value = folder
-						loadManage(true)
-					})
-					button.style.width = '100%'
-					manageList.append(row)
+				if (reset) {
+					driveList.textContent = ''
+					drivePageFiles = []
 				}
-
-				for (const file of data.files || []) {
-					const row = document.createElement('div')
-					row.className = 'result-item'
-					const head = document.createElement('div')
-					head.textContent = file.name + '（' + formatBytes(file.size) + '）'
-					const url = document.createElement('input')
-					url.className = 'row-url'
-					url.readOnly = true
-					url.value = file.url || ''
-					const actions = document.createElement('div')
-					actions.className = 'row-actions'
-					row.append(head, url, actions)
-					manageList.append(row)
-
-					if (file.url) {
-						const preview = document.createElement('a')
-						preview.href = file.url
-						preview.target = '_blank'
-						preview.rel = 'noopener'
-						preview.textContent = '预览 ↗'
-						actions.append(preview)
-						appendCopyButton(actions, url)
-					}
-
-					const parent = file.key.slice(0, file.key.lastIndexOf('/'))
-					addButton(actions, '申请重命名', async () => {
-						const newName = prompt('输入新文件名（保留扩展名）', file.name)
-						if (!newName || newName === file.name)
-							return
-						if (newName.includes('/') || newName.includes('\\\\') || !/\\.(?:jpg|jpeg|png|webp|gif|avif)$/i.test(newName)) {
-							alert('文件名格式不正确')
-							return
-						}
-						try {
-							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent + '/' + newName })
-							alert('已提交申请：' + result.requestId)
-							loadRequests()
-						}
-						catch (error) {
-							alert(error.message)
-						}
-					})
-					addButton(actions, '申请移动', async () => {
-						const target = prompt('输入目标目录编号（例如 05/10）', parent)
-						if (!target || target === parent)
-							return
-						if (!/^\\d{1,3}(?:\\/\\d{1,3})*$/.test(target.trim())) {
-							alert('目录格式应为数字编号路径')
-							return
-						}
-						try {
-							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: target.trim() + '/' + file.name })
-							alert('已提交申请：' + result.requestId)
-							loadRequests()
-						}
-						catch (error) {
-							alert(error.message)
-						}
-					})
-					addButton(actions, '申请删除', async () => {
-						if (!confirm('确认提交删除 ' + file.key + ' 的申请吗？'))
-							return
-						try {
-							const result = await apiPost('/api/file', { action: 'delete', key: file.key })
-							alert('已提交申请：' + result.requestId)
-							loadRequests()
-						}
-						catch (error) {
-							alert(error.message)
-						}
-					})
-				}
-
-				manageMoreWrap.hidden = !data.truncated
-				manageCursor = data.truncated ? data.cursor : ''
+				drivePageFiles = drivePageFiles.concat(data.files || [])
+				for (const folder of data.folders || [])
+					renderFolderRow(folder)
+				for (const file of data.files || [])
+					renderFileRow(file)
+				driveEmpty.hidden = reset && !(data.folders || []).length && !(data.files || []).length
+				driveMoreWrap.hidden = !data.truncated
+				driveCursor = data.truncated ? data.cursor : ''
+				renderCrumbs()
 			}
 			catch (error) {
-				alert(error.message || '列表加载失败')
+				driveNoticeMessage(error.message || '加载失败', true)
 			}
 			finally {
-				manageLoading = false
-				manageListBtn.disabled = false
-				manageListBtn.textContent = '列出'
+				driveLoading = false
+				driveRefresh.disabled = false
+				driveRefresh.textContent = '刷新'
 			}
+		}
+
+		function hideDriveContext() {
+			driveContext.hidden = true
+			driveContext.textContent = ''
+		}
+
+		function showDriveContext(event, target) {
+			hideDriveContext()
+			if (!target.folder) {
+				const copy = addButton(driveContext, '复制链接', () => navigator.clipboard.writeText(target.url || ''))
+				copy.type = 'button'
+				addButton(driveContext, '重命名', () => { hideDriveContext(); openRenameDialog(target) }).type = 'button'
+				addButton(driveContext, '移动', () => { hideDriveContext(); openMoveDialog([target]) }).type = 'button'
+				addButton(driveContext, '删除', () => { hideDriveContext(); openDeleteDialog([target]) }).type = 'button'
+			}
+			else {
+				addButton(driveContext, '打开文件夹', () => { hideDriveContext(); openDriveFolder(target.folder) }).type = 'button'
+			}
+			const width = driveContext.offsetWidth || 160
+			driveContext.style.left = Math.min(event.clientX, window.innerWidth - width - 8) + 'px'
+			driveContext.style.top = Math.min(event.clientY, window.innerHeight - 150) + 'px'
+			driveContext.hidden = false
+		}
+
+		function openDialog(title, body, okText, onOk) {
+			driveDialogTitle.textContent = title
+			driveDialogBody.textContent = ''
+			driveDialogBody.append(body)
+			driveDialogOk.textContent = okText
+			driveDialog.dataset.handler = ''
+			driveDialog._onOk = onOk
+			driveDialog.hidden = false
+		}
+
+		function closeDialog() {
+			driveDialog.hidden = true
+			driveDialogBody.textContent = ''
+			driveDialog._onOk = null
+		}
+
+		function dialogButton(text, kind) {
+			const button = document.createElement('button')
+			button.type = 'button'
+			button.textContent = text
+			if (kind)
+				button.className = kind
+			return button
+		}
+
+		function openDeleteDialog(files) {
+			const body = document.createElement('div')
+			const intro = document.createElement('p')
+			intro.textContent = '将提交删除申请，owner 批准后才会真正删除：'
+			body.append(intro)
+			const list = document.createElement('ul')
+			for (const file of files) {
+				const item = document.createElement('li')
+				item.textContent = file.key
+				list.append(item)
+			}
+			body.append(list)
+			openDialog('申请删除', body, '提交删除申请', async () => {
+				driveDialogOk.disabled = true
+				try {
+					let count = 0
+					for (const file of files) {
+						await apiPost('/api/file', { action: 'delete', key: file.key })
+						count++
+					}
+					driveNoticeMessage('已提交 ' + count + ' 条删除申请，等待 owner 批准', false)
+					closeDialog()
+					driveSelected.clear()
+					updateDriveSelectionUI()
+					loadDrive(true)
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+		}
+
+		function openRenameDialog(file) {
+			const body = document.createElement('div')
+			const input = document.createElement('input')
+			input.type = 'text'
+			input.value = file.name
+			input.style.width = '100%'
+			body.append(input)
+			openDialog('重命名 ' + file.name, body, '提交重命名申请', async () => {
+				const newName = input.value.trim()
+				const parent = file.key.slice(0, file.key.lastIndexOf('/'))
+				if (!newName || newName === file.name) {
+					alert('请输入新文件名')
+					return
+				}
+				if (newName.includes('/') || newName.includes('\\\\') || !/\\.(?:jpg|jpeg|png|webp|gif|avif)$/i.test(newName)) {
+					alert('文件名格式不正确，请保留图片扩展名')
+					return
+				}
+				try {
+					const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent + '/' + newName })
+					driveNoticeMessage('已提交重命名申请：' + result.requestId, false)
+					closeDialog()
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+			})
+		}
+
+		let moveDestination = ''
+		let moveLevels = []
+
+		function clearMoveLevelsFrom(from) {
+			while (moveLevels.length > from) {
+				const level = moveLevels.pop()
+				level.element.remove()
+			}
+		}
+
+		function renderMoveLevel(prefix) {
+			const children = childrenOf(prefix)
+			const element = document.createElement('div')
+			element.className = 'article-level'
+			const label = document.createElement('span')
+			label.className = 'level-label'
+			label.textContent = prefix.length ? '第 ' + (prefix.length + 1) + ' 级' : '第 1 级'
+			const select = document.createElement('select')
+			select.className = 'level-select'
+			addOption(select, '请选择…', '')
+			for (const folder of children.folders)
+				addOption(select, '📁 ' + folder, 'dir:' + folder)
+			for (const article of children.articles)
+				addOption(select, '📄 ' + article, 'art:' + article)
+			const index = moveLevels.length
+			moveLevels.push({ element, prefix })
+			element.append(label, select)
+			movePickerBody.append(element)
+			select.addEventListener('change', () => {
+				if (!select.value)
+					return
+				const value = select.value.slice(4)
+				const isArticle = select.value.startsWith('art:')
+				clearMoveLevelsFrom(index + 1)
+				if (isArticle) {
+					const full = prefix.concat(value)
+					const digits = full.map(part => (part.match(/^\\d+/) || [''])[0]).filter(Boolean).join('/')
+					moveDestination = digits
+					moveDestNote.textContent = '将移动到：' + full.join(' / ') + '（' + digits + '）'
+				}
+				else {
+					moveDestination = ''
+					moveDestNote.textContent = ''
+					renderMoveLevel(prefix.concat(value))
+				}
+			})
+		}
+
+		let movePickerBody = null
+		let moveDestNote = null
+		let moveTargetFiles = []
+
+		function openMoveDialog(files) {
+			moveTargetFiles = files
+			moveDestination = ''
+			moveLevels = []
+			const body = document.createElement('div')
+			const hint = document.createElement('p')
+			hint.textContent = files.length > 1 ? '将移动 ' + files.length + ' 张图片到：' : '将移动：' + files[0].name
+			movePickerBody = document.createElement('div')
+			moveDestNote = document.createElement('p')
+			moveDestNote.className = 'drive-hint'
+			body.append(hint, movePickerBody, moveDestNote)
+			openDialog('申请移动', body, '提交移动申请', async () => {
+				if (!moveDestination) {
+					alert('请先逐级选择目标文章目录')
+					return
+				}
+				driveDialogOk.disabled = true
+				try {
+					let count = 0
+					for (const file of moveTargetFiles) {
+						const newKey = moveDestination + '/' + file.name
+						if (newKey !== file.key) {
+							await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey })
+							count++
+						}
+					}
+					driveNoticeMessage('已提交 ' + count + ' 条移动申请，等待 owner 批准', false)
+					closeDialog()
+					driveSelected.clear()
+					updateDriveSelectionUI()
+					loadDrive(true)
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+			renderMoveLevel([])
 		}
 
 		function requestDescription(request) {
@@ -1100,20 +1465,58 @@ function page(request: Request, env: Env): Response {
 			}
 		}
 
-		if (manageListBtn) {
-			manageListBtn.addEventListener('click', () => loadManage(true))
-			manageMore.addEventListener('click', () => loadManage(false))
-			manageFolderInput.addEventListener('keydown', event => {
-				if (event.key === 'Enter')
-					loadManage(true)
+		function syncDriveRows() {
+			for (const row of driveList.children) {
+				const key = row.dataset ? row.dataset.key : ''
+				const checkbox = row.querySelector ? row.querySelector('input[type=checkbox]') : null
+				if (checkbox && !checkbox.disabled) {
+					const checked = key && driveSelected.has(key)
+					checkbox.checked = Boolean(checked)
+					row.classList.toggle('selected', Boolean(checked))
+				}
+			}
+		}
+
+		if (driveList) {
+			driveRefresh.addEventListener('click', () => loadDrive(true))
+			driveMore.addEventListener('click', () => loadDrive(false))
+			driveUp.addEventListener('click', () => {
+				const index = driveFolder.lastIndexOf('/')
+				openDriveFolder(index >= 0 ? driveFolder.slice(0, index) : '')
 			})
+			driveSelectAll.addEventListener('click', () => {
+				const visible = drivePageFiles
+				const allSelected = visible.length > 0 && visible.every(file => driveSelected.has(file.key))
+				if (allSelected) {
+					for (const file of visible)
+						driveSelected.delete(file.key)
+				}
+				else {
+					for (const file of visible)
+						driveSelected.set(file.key, file)
+				}
+				syncDriveRows()
+				updateDriveSelectionUI()
+			})
+			driveClearSelection.addEventListener('click', () => {
+				driveSelected.clear()
+				syncDriveRows()
+				updateDriveSelectionUI()
+			})
+			driveBatchDelete.addEventListener('click', () => openDeleteDialog([...driveSelected.values()]))
+			driveBatchMove.addEventListener('click', () => openMoveDialog([...driveSelected.values()]))
+			driveDialogCancel.addEventListener('click', closeDialog)
+			driveDialogOk.addEventListener('click', async () => {
+				if (driveDialog._onOk)
+					await driveDialog._onOk()
+			})
+			document.addEventListener('click', hideDriveContext)
+			loadDrive(true)
 		}
 		if (myReqRefresh)
 			myReqRefresh.addEventListener('click', loadRequests)
 		if (approvalRefresh)
 			approvalRefresh.addEventListener('click', loadRequests)
-		if (manageListBtn)
-			loadManage(true)
 		loadRequests()
 	</script>
 </body>
