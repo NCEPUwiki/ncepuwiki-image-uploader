@@ -1265,14 +1265,13 @@ function page(request: Request, env: Env): Response {
 			const input = document.createElement('input')
 			input.type = 'text'
 			input.inputMode = 'numeric'
-			input.pattern = '\\d{1,3}'
 			input.maxLength = 3
 			input.style.width = '100%'
 			label.append(document.createElement('br'), input)
 			body.append(hint, label)
 			openDialog('新建文件夹', body, '提交新建申请', async () => {
 				const name = input.value.trim()
-				if (!/^\d{1,3}$/.test(name)) {
+				if (!/^\\d{1,3}$/.test(name)) {
 					alert('文件夹编号只能是 1-3 位数字，例如 99')
 					return
 				}
