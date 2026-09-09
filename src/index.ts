@@ -456,10 +456,20 @@ async function upload(request: Request, env: Env): Promise<Response> {
 	if (file.size === 0)
 		return json({ error: '图片内容为空' }, 400)
 
-	const articlePath = String(form.get('article') || '').trim()
-	const folder = articleFolder(articlePath)
-	if (!folder)
-		return json({ error: '请填写图片所属文章路径，例如 docs/05.校园生活/09.美食.md' }, 400)
+	const folderParam = String(form.get('folder') || '').trim()
+	let folder = ''
+	if (folderParam) {
+		if (!FOLDER_RE.test(folderParam))
+			return json({ error: '目录格式应为数字编号路径，例如 05/09' }, 400)
+		folder = folderParam
+	}
+	else {
+		const articlePath = String(form.get('article') || '').trim()
+		const derived = articleFolder(articlePath)
+		if (!derived)
+			return json({ error: '缺少上传目录：请指定数字目录（如 05/09）或文章路径' }, 400)
+		folder = derived
+	}
 
 	const bytes = await file.arrayBuffer()
 	const digest = await crypto.subtle.digest('SHA-256', bytes)
@@ -527,25 +537,48 @@ function page(request: Request, env: Env): Response {
 	const email = identity.email ? `<span id="email">${escapeHtml(identity.email)}</span>` : '<span id="email">未登录（尚未启用 Access）</span>'
 	const isAdmin = isAdminIdentity(identity.email, env)
 	const managementCard = `
-	<div class="card">
+	<div class="card drive-card" id="driveCard">
 		<h2>图片库</h2>
-		<p class="drive-hint">点目录进入浏览；移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
+		<p class="drive-hint">进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
 		<div class="drive-toolbar">
 			<button type="button" id="driveUp">↑ 返回上级</button>
 			<div id="driveCrumbs" class="drive-crumbs"></div>
 			<span class="drive-spacer"></span>
+			<div class="upload-split">
+				<button type="button" id="driveUpload" class="upload-main" title="上传图片">上传</button>
+				<button type="button" id="driveUploadToggle" class="upload-arrow" aria-label="更多上传方式" aria-haspopup="menu">▾</button>
+				<div id="driveUploadMenu" class="upload-menu" hidden>
+					<button type="button" id="driveUploadFiles">上传文件…</button>
+					<button type="button" id="driveUploadFolder">上传文件夹…</button>
+				</div>
+			</div>
 			<button type="button" id="driveSelectAll">全选本页</button>
 			<button type="button" id="driveRefresh">刷新</button>
 		</div>
+		<input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple hidden>
+		<input id="folderInput" type="file" webkitdirectory multiple hidden>
 		<div id="driveSelection" class="drive-selection" hidden>
 			已选 <strong id="driveSelectedCount">0</strong> 项
 			<button type="button" id="driveBatchDelete">申请删除</button>
 			<button type="button" id="driveBatchMove">申请移动</button>
 			<button type="button" id="driveClearSelection">取消选择</button>
 		</div>
+		<div id="uploadQueue" class="upload-queue" hidden>
+			<div class="upload-queue-head">
+				<strong id="uploadQueueTitle">上传</strong>
+				<button type="button" id="uploadQueueClose">收起</button>
+			</div>
+			<div id="uploadQueueList" class="upload-queue-list"></div>
+		</div>
 		<div id="driveList" class="drive-list"></div>
 		<p id="driveEmpty" class="drive-empty" hidden>这个目录还没有图片</p>
 		<p id="driveMoreWrap" hidden><button type="button" id="driveMore">加载更多</button></p>
+		<div id="driveDropLayer" class="drive-drop-layer" hidden>
+			<div class="drive-drop-inner">
+				<p class="drive-drop-title">松开鼠标上传图片</p>
+				<p class="drive-drop-sub">图片将存入 <strong id="driveDropTarget">当前目录</strong></p>
+			</div>
+		</div>
 		<p id="driveNotice" class="msg"></p>
 	</div>
 	<div class="card">
@@ -576,15 +609,12 @@ function page(request: Request, env: Env): Response {
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<title>NCEPUwiki 图片上传</title>
+	<title>NCEPUwiki 图片库</title>
 	<style>
 		:root { color-scheme: light dark; }
 		[hidden] { display: none !important; }
 		body { font-family: system-ui, sans-serif; max-width: 900px; margin: 48px auto; padding: 0 20px; }
 		.card { border: 1px solid #ccc; border-radius: 12px; padding: 24px; }
-		.drop { border: 2px dashed #888; border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; }
-		.drop.over { border-color: #1d6fff; background: #1d6fff14; }
-		.result { margin-top: 18px; }
 		.result-item { border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
 		.result-item .row-url { width: 100%; box-sizing: border-box; font-size: 12px; }
 		.result-item .row-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
@@ -598,11 +628,33 @@ function page(request: Request, env: Env): Response {
 		.level-select { max-width: 100%; }
 		.drive-hint { color: #666; font-size: 13px; }
 		.drive-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+		.drive-card { position: relative; }
+		.drive-toolbar button { padding: 5px 12px; border-radius: 7px; border: 1px solid #ccc; background: #fff; color: #111; font-size: 14px; }
+		.drive-toolbar button:hover { background: #eef4ff; }
 		.drive-crumbs { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 13px; }
 		.drive-crumbs button { border: none; background: transparent; padding: 4px 6px; border-radius: 6px; color: #1d6fff; }
 		.drive-crumbs button:hover { background: #00000012; }
 		.drive-spacer { flex: 1; }
+		.upload-split { position: relative; display: flex; }
+		.upload-split .upload-main { background: #1d6fff; border-color: #1d6fff; color: #fff; border-radius: 7px 0 0 7px; }
+		.upload-split .upload-arrow { border-left: none; border-radius: 0 7px 7px 0; padding: 5px 9px; }
+		.upload-split .upload-main:hover, .upload-split .upload-arrow:hover { background: #0d5fe0; }
+		.upload-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 60; background: #fff; color: #111; border: 1px solid #ddd; border-radius: 8px; box-shadow: 0 8px 24px #0003; min-width: 160px; padding: 4px; }
+		.upload-menu button { display: block; width: 100%; text-align: left; border: none; background: transparent; padding: 7px 10px; border-radius: 5px; font-size: 14px; }
+		.upload-menu button:hover { background: #eef4ff; }
 		.drive-selection { background: #eef5ff; border: 1px solid #bcd6ff; border-radius: 8px; padding: 6px 10px; margin: 6px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+		.upload-queue { margin: 8px 0; border: 1px solid #cfe0ff; border-radius: 10px; overflow: hidden; background: #f5f9ff; }
+		.upload-queue-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; background: #eaf2ff; font-size: 14px; }
+		.upload-queue-head button { border: none; background: transparent; color: #1d6fff; font-size: 13px; }
+		.upload-queue-list { max-height: 260px; overflow: auto; padding: 4px 12px; }
+		.upload-item { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px dashed #d5e5ff; font-size: 13px; }
+		.upload-item:last-child { border-bottom: none; }
+		.upload-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+		.upload-name small { display: block; color: #888; }
+		.upload-state { flex: none; max-width: 280px; text-align: right; }
+		.upload-actions { flex: none; display: flex; gap: 6px; }
+		.upload-actions button, .upload-actions a { border: none; background: transparent; color: #1d6fff; padding: 3px 6px; border-radius: 5px; text-decoration: none; font-size: 13px; }
+		.upload-actions button:hover, .upload-actions a:hover { background: #1d6fff1f; }
 		.drive-list { border: 1px solid #eee; border-radius: 8px; overflow: hidden; }
 		.drive-item { display: flex; gap: 10px; align-items: center; padding: 6px 10px; border-bottom: 1px solid #f1f1f1; cursor: default; }
 		.drive-item:last-child { border-bottom: none; }
@@ -621,6 +673,10 @@ function page(request: Request, env: Env): Response {
 		.drive-actions button, .drive-actions a { border: none; background: transparent; color: #1d6fff; padding: 4px 7px; border-radius: 6px; text-decoration: none; font-size: 13px; }
 		.drive-actions button:hover, .drive-actions a:hover { background: #1d6fff1f; }
 		.drive-empty { color: #888; text-align: center; padding: 26px 0; }
+		.drive-drop-layer { position: absolute; inset: 0; z-index: 20; background: #1d6fff1f; border-radius: 12px; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+		.drive-drop-inner { background: #fff; color: #111; border: 1px solid #1d6fff; border-radius: 12px; padding: 22px 34px; text-align: center; box-shadow: 0 12px 32px #0004; }
+		.drive-drop-title { margin: 0 0 6px; font-size: 17px; }
+		.drive-drop-sub { margin: 0; color: #555; font-size: 13px; }
 		.modal-mask { position: fixed; inset: 0; background: #00000066; display: flex; align-items: center; justify-content: center; z-index: 30; }
 		.modal { background: #fff; color: #111; border-radius: 10px; padding: 18px 20px; width: min(92vw, 520px); max-height: 84vh; overflow: auto; box-shadow: 0 16px 40px #0003; }
 		.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
@@ -632,49 +688,24 @@ function page(request: Request, env: Env): Response {
 	</style>
 </head>
 <body>
-	<h1>NCEPUwiki 图片上传</h1>
+	<h1>NCEPUwiki 图片库</h1>
 	<p id="identity">当前身份：${email}</p>
-	<div class="card">
-		<div class="drop" id="drop">
-			<p>把图片拖到这里，或点击选择文件</p>
-			<small>支持 JPG / PNG / WebP / GIF / AVIF，≤ 10MB</small>
-		</div>
-		<input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple hidden>
-		<input id="folderInput" type="file" webkitdirectory multiple hidden>
-		<p>
-			<button type="button" id="pickFiles">选择图片文件</button>
-			<button type="button" id="pickFolder">选择整个文件夹</button>
-		</p>
-		<p><strong>图片所属文章</strong></p>
-		<div id="articlePicks"></div>
-		<p id="articleStatus" class="msg">正在加载文章目录…</p>
-		<p><button type="button" id="manualToggle">＋ 没有我要的文章？手动输入</button></p>
-		<div id="articleManual" hidden>
-			<p><label>手动填写文章路径：<br><input id="article" type="text" size="60" placeholder="例如：05.校园生活/09.美食 或 docs/05.校园生活/09.美食.md"></label></p>
-		</div>
-		<button id="upload">上传</button>
-		<div class="msg" id="msg"></div>
-		<div class="result" id="result" hidden>
-			<p><strong>上传结果（批准后才能得到公开链接）：</strong></p>
-			<div id="resultList"></div>
-		</div>
-	</div>
 	${managementCard}${approvalCard}${dialogMarkup}
 	<script type="module">
-		const drop = document.querySelector('#drop')
 		const fileInput = document.querySelector('#fileInput')
 		const folderInput = document.querySelector('#folderInput')
-		const pickFiles = document.querySelector('#pickFiles')
-		const pickFolder = document.querySelector('#pickFolder')
-		const articleInput = document.querySelector('#article')
-		const articlePicks = document.querySelector('#articlePicks')
-		const articleStatus = document.querySelector('#articleStatus')
-		const articleManual = document.querySelector('#articleManual')
-		const manualToggle = document.querySelector('#manualToggle')
-		const uploadButton = document.querySelector('#upload')
-		const msg = document.querySelector('#msg')
-		const result = document.querySelector('#result')
-		const resultList = document.querySelector('#resultList')
+		const driveCard = document.querySelector('#driveCard')
+		const driveUpload = document.querySelector('#driveUpload')
+		const driveUploadToggle = document.querySelector('#driveUploadToggle')
+		const driveUploadMenu = document.querySelector('#driveUploadMenu')
+		const driveUploadFiles = document.querySelector('#driveUploadFiles')
+		const driveUploadFolder = document.querySelector('#driveUploadFolder')
+		const uploadQueue = document.querySelector('#uploadQueue')
+		const uploadQueueTitle = document.querySelector('#uploadQueueTitle')
+		const uploadQueueList = document.querySelector('#uploadQueueList')
+		const uploadQueueClose = document.querySelector('#uploadQueueClose')
+		const driveDropLayer = document.querySelector('#driveDropLayer')
+		const driveDropTarget = document.querySelector('#driveDropTarget')
 		const driveList = document.querySelector('#driveList')
 		const driveCrumbs = document.querySelector('#driveCrumbs')
 		const driveUp = document.querySelector('#driveUp')
@@ -700,21 +731,28 @@ function page(request: Request, env: Env): Response {
 		const approvalList = document.querySelector('#approvalList')
 		const approvalRefresh = document.querySelector('#approvalRefresh')
 
-		let pendingFiles = []
 		let allArticles = []
-		let articleValue = ''
-		let levelState = []
 		let driveFolder = ''
 		let driveCursor = ''
 		let driveLoading = false
 		let drivePageFiles = []
 		let driveSelected = new Map()
+		let uploadRunning = false
+		let dragDepth = 0
 
 		function isImage(file) {
 			return ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'].includes(file.type)
 		}
 
-		function addFiles(fileList) {
+		function hideUploadMenu() {
+			driveUploadMenu.hidden = true
+		}
+
+		function addUploadFiles(fileList) {
+			if (uploadRunning) {
+				driveNoticeMessage('上一批图片仍在处理，请稍候再试', true)
+				return
+			}
 			const images = []
 			let ignored = 0
 			for (const file of fileList) {
@@ -728,43 +766,98 @@ function page(request: Request, env: Env): Response {
 					ignored++
 			}
 			if (!images.length) {
-				msg.textContent = '没有找到可上传的图片（仅支持 JPG / PNG / WebP / GIF / AVIF）。'
-				msg.className = 'msg error'
+				driveNoticeMessage('没有找到可上传的图片（仅支持 JPG / PNG / WebP / GIF / AVIF）。', true)
 				return
 			}
-			pendingFiles = pendingFiles.concat(images)
-			showSelection(ignored)
+			hideUploadMenu()
+			if (driveFolder)
+				uploadImages(images, driveFolder, ignored)
+			else
+				chooseArticleDestination(images, ignored)
 		}
 
-		function showSelection(ignored) {
-			const totalMb = pendingFiles.reduce((sum, file) => sum + file.size, 0) / 1024 / 1024
-			msg.textContent = '已选择 ' + pendingFiles.length + ' 张图片（共 ' + totalMb.toFixed(2) + ' MB）' + (ignored ? '，已忽略 ' + ignored + ' 个非图片文件' : '')
-			msg.className = 'msg'
-			uploadButton.disabled = false
-		}
-
-		drop.addEventListener('click', () => fileInput.click())
-		pickFiles.addEventListener('click', () => fileInput.click())
-		pickFolder.addEventListener('click', () => folderInput.click())
 		fileInput.addEventListener('change', () => {
-			addFiles(fileInput.files)
+			addUploadFiles(fileInput.files)
 			fileInput.value = ''
 		})
 		folderInput.addEventListener('change', () => {
-			addFiles(folderInput.files)
+			addUploadFiles(folderInput.files)
 			folderInput.value = ''
 		})
-		drop.addEventListener('dragover', event => { event.preventDefault(); drop.classList.add('over') })
-		drop.addEventListener('dragleave', () => drop.classList.remove('over'))
-		drop.addEventListener('drop', event => {
-			event.preventDefault()
-			drop.classList.remove('over')
-			addFiles(event.dataTransfer.files)
+
+		driveUpload.addEventListener('click', () => {
+			fileInput.click()
 		})
+		driveUploadToggle.addEventListener('click', event => {
+			event.stopPropagation()
+			driveUploadMenu.hidden = !driveUploadMenu.hidden
+		})
+		driveUploadFiles.addEventListener('click', () => {
+			fileInput.click()
+		})
+		driveUploadFolder.addEventListener('click', () => {
+			folderInput.click()
+		})
+		document.addEventListener('click', hideUploadMenu)
+
+		uploadQueueClose.addEventListener('click', () => {
+			uploadQueue.hidden = true
+		})
+
+		function showDropLayer() {
+			if (!driveFolder)
+				driveDropTarget.textContent = '目标文章'
+			else
+				driveDropTarget.textContent = driveFolder
+			driveDropLayer.hidden = false
+		}
+
+		function hideDropLayer() {
+			dragDepth = 0
+			driveDropLayer.hidden = true
+		}
+
+		if (driveCard) {
+			driveCard.addEventListener('dragenter', event => {
+				if (!event.dataTransfer || !Array.from(event.dataTransfer.types).includes('Files'))
+					return
+				event.preventDefault()
+				dragDepth++
+				showDropLayer()
+			})
+			driveCard.addEventListener('dragover', event => {
+				if (Array.from(event.dataTransfer.types).includes('Files'))
+					event.preventDefault()
+			})
+			driveCard.addEventListener('dragleave', () => {
+				dragDepth = Math.max(0, dragDepth - 1)
+				if (!dragDepth)
+					hideDropLayer()
+			})
+			driveCard.addEventListener('drop', event => {
+				event.preventDefault()
+				hideDropLayer()
+				const files = event.dataTransfer ? event.dataTransfer.files : null
+				if (!files || !files.length)
+					return
+				const targetRow = event.target instanceof Element ? event.target.closest('.drive-item.folder[data-folder]') : null
+				if (targetRow && driveFolder !== targetRow.dataset.folder)
+					openDriveFolder(targetRow.dataset.folder)
+				addUploadFiles(files)
+			})
+		}
+
 		document.addEventListener('paste', event => {
-			const item = [...event.clipboardData.items].find(item => item.type.startsWith('image/'))
-			if (item)
-				addFiles([item.getAsFile()])
+			if (!event.clipboardData)
+				return
+			const active = document.activeElement
+			if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable))
+				return
+			const images = [...event.clipboardData.items].filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+			if (!images.length)
+				return
+			event.preventDefault()
+			addUploadFiles(images.map(item => item.getAsFile()))
 		})
 
 		function addOption(select, text, value) {
@@ -802,67 +895,6 @@ function page(request: Request, env: Env): Response {
 			return { folders: [...folders.keys()], articles }
 		}
 
-		function pickArticle(path) {
-			articleValue = path
-			articleManual.hidden = true
-			articleStatus.className = 'msg ok'
-			articleStatus.textContent = '已选择：' + path
-		}
-
-		function clearLevelsFrom(fromIndex) {
-			while (levelState.length > fromIndex) {
-				const level = levelState.pop()
-				level.element.remove()
-			}
-		}
-
-		function createLevel(prefix) {
-			const children = childrenOf(prefix)
-			if (children.folders.length + children.articles.length === 0)
-				return
-
-			const element = document.createElement('div')
-			element.className = 'article-level'
-			const label = document.createElement('span')
-			label.className = 'level-label'
-			label.textContent = prefix.length ? '第 ' + (prefix.length + 1) + ' 级（当前 ' + prefix.join(' / ') + '）' : '第 1 级：'
-			const select = document.createElement('select')
-			select.className = 'level-select'
-			addOption(select, '请选择…', '')
-			for (const folder of children.folders)
-				addOption(select, '📁 ' + folder, 'dir:' + folder)
-			for (const article of children.articles)
-				addOption(select, '📄 ' + article, 'art:' + article)
-
-			const levelIndex = levelState.length
-			levelState.push({ element, select, prefix })
-			element.append(label, select)
-			articlePicks.append(element)
-
-			select.addEventListener('change', () => {
-				const raw = select.value
-				if (!raw)
-					return
-				const value = raw.slice(4)
-				const isArticle = raw.startsWith('art:')
-				clearLevelsFrom(levelIndex + 1)
-				articleValue = ''
-				if (isArticle) {
-					pickArticle(prefix.concat(value).join('/'))
-					return
-				}
-				articleStatus.className = 'msg'
-				articleStatus.textContent = '已选目录：' + prefix.concat(value).join(' / ') + '，继续选择下一级'
-				createLevel(prefix.concat(value))
-			})
-		}
-
-		function startLevels() {
-			clearLevelsFrom(0)
-			articleValue = ''
-			createLevel([])
-		}
-
 		async function loadArticles() {
 			try {
 				const response = await fetch('/api/articles')
@@ -870,86 +902,191 @@ function page(request: Request, env: Env): Response {
 					throw new Error('加载失败')
 				const data = await response.json()
 				allArticles = data.articles || []
-				if (!allArticles.length)
-					throw new Error('列表为空')
-				startLevels()
-				articleStatus.className = 'msg'
-				articleStatus.textContent = '按栏目逐级选择文章；新建文章点下方“手动输入”。'
 			}
 			catch {
-				articleStatus.className = 'msg error'
-				articleStatus.textContent = '文章列表加载失败，请使用手动输入。'
-				articleManual.hidden = false
+				allArticles = []
 			}
 		}
 		loadArticles()
 
-		manualToggle.addEventListener('click', () => {
-			articleManual.hidden = !articleManual.hidden
-			if (!articleManual.hidden)
-				articleInput.focus()
-		})
-
-		articleInput.addEventListener('input', () => {
-			articleValue = articleInput.value.trim()
-			if (articleValue) {
-				articleStatus.className = 'msg'
-				articleStatus.textContent = '将按输入路径分层存放：' + articleValue
+		async function chooseArticleDestination(images, ignored) {
+			if (!allArticles.length) {
+				driveNoticeMessage('正在加载文章目录…', false)
+				await loadArticles()
 			}
-		})
+			const body = document.createElement('div')
+			const hint = document.createElement('p')
+			hint.textContent = '从“全部”上传时，请选择这些图片要放到的文章；图片会自动按文章编号存入对应目录。'
+			const picks = document.createElement('div')
+			const note = document.createElement('p')
+			note.className = 'drive-hint'
+			const toggle = document.createElement('button')
+			toggle.type = 'button'
+			toggle.textContent = '＋ 没有我要的文章？手动输入'
+			const manualWrap = document.createElement('div')
+			manualWrap.hidden = true
+			const manualLabel = document.createElement('label')
+			manualLabel.textContent = '手动填写文章路径：'
+			const manualInput = document.createElement('input')
+			manualInput.type = 'text'
+			manualInput.style.width = '100%'
+			manualInput.placeholder = '例如：05.校园生活/09.美食 或 docs/05.校园生活/09.美食.md'
+			manualLabel.append(document.createElement('br'), manualInput)
+			manualWrap.append(manualLabel)
+			body.append(hint, picks, note, toggle, manualWrap)
 
-		function createResultRow(file) {
-			const row = document.createElement('div')
-			row.className = 'result-item'
-			const name = document.createElement('div')
-			name.textContent = file.name
-			const url = document.createElement('input')
-			url.className = 'row-url'
-			url.readOnly = true
-			url.value = '上传中…'
-			const actions = document.createElement('div')
-			actions.className = 'row-actions'
-			const note = document.createElement('span')
-			row.append(name, url, actions, note)
-			resultList.append(row)
-			return { row, url, actions, note }
+			const levels = []
+			let articlePath = ''
+			function clearLevelsFrom(fromIndex) {
+				while (levels.length > fromIndex) {
+					const level = levels.pop()
+					level.element.remove()
+				}
+			}
+			function renderLevel(prefix) {
+				const children = childrenOf(prefix)
+				if (children.folders.length + children.articles.length === 0)
+					return
+				const element = document.createElement('div')
+				element.className = 'article-level'
+				const label = document.createElement('span')
+				label.className = 'level-label'
+				label.textContent = prefix.length ? '第 ' + (prefix.length + 1) + ' 级（当前 ' + prefix.join(' / ') + '）' : '第 1 级：'
+				const select = document.createElement('select')
+				select.className = 'level-select'
+				addOption(select, '请选择…', '')
+				for (const folder of children.folders)
+					addOption(select, '📁 ' + folder, 'dir:' + folder)
+				for (const article of children.articles)
+					addOption(select, '📄 ' + article, 'art:' + article)
+				const index = levels.length
+				levels.push({ element })
+				element.append(label, select)
+				picks.append(element)
+				select.addEventListener('change', () => {
+					if (!select.value)
+						return
+					const value = select.value.slice(4)
+					clearLevelsFrom(index + 1)
+					if (select.value.startsWith('art:')) {
+						articlePath = prefix.concat(value).join('/')
+						note.textContent = '将按文章编号存到：' + articlePath
+					}
+					else {
+						articlePath = ''
+						note.textContent = ''
+						renderLevel(prefix.concat(value))
+					}
+				})
+			}
+			function rebuildPicker() {
+				picks.hidden = false
+				clearLevelsFrom(0)
+				renderLevel([])
+			}
+			rebuildPicker()
+			if (!allArticles.length) {
+				picks.hidden = true
+				toggle.hidden = true
+				manualWrap.hidden = false
+				note.textContent = '文章列表加载失败，请直接填写文章路径。'
+				manualInput.focus()
+			}
+			toggle.addEventListener('click', () => {
+				manualWrap.hidden = !manualWrap.hidden
+				if (!manualWrap.hidden) {
+					articlePath = ''
+					note.textContent = ''
+					picks.hidden = true
+					clearLevelsFrom(0)
+					manualInput.focus()
+				}
+				else {
+					rebuildPicker()
+				}
+			})
+			manualInput.addEventListener('input', () => {
+				articlePath = manualInput.value.trim()
+				note.textContent = articlePath ? '将按输入路径分层存放：' + articlePath : ''
+			})
+
+			let started = false
+			openDialog('上传到哪篇文章？', body, '继续上传', async () => {
+				const target = manualInput.value.trim() || articlePath
+				if (!target) {
+					alert('请先选择或填写图片所属文章')
+					return
+				}
+				if (started)
+					return
+				started = true
+				closeDialog()
+				uploadImages(images, target, ignored, true)
+			})
 		}
 
-		function appendCopyButton(actions, urlInput) {
+		function createUploadRow(file) {
+			const row = document.createElement('div')
+			row.className = 'upload-item'
+			const nameBox = document.createElement('div')
+			nameBox.className = 'upload-name'
+			const name = document.createElement('span')
+			name.textContent = file.name
+			const meta = document.createElement('small')
+			meta.textContent = formatBytes(file.size) + (file.type ? ' · ' + file.type : '')
+			nameBox.append(name, meta)
+			const status = document.createElement('span')
+			status.className = 'upload-state'
+			status.textContent = '上传中…'
+			const actions = document.createElement('span')
+			actions.className = 'upload-actions'
+			row.append(nameBox, status, actions)
+			uploadQueueList.append(row)
+			return { row, status, actions }
+		}
+
+		function addCopyAction(actions, url) {
 			const copy = document.createElement('button')
 			copy.type = 'button'
 			copy.textContent = '复制链接'
 			copy.addEventListener('click', async () => {
-				await navigator.clipboard.writeText(urlInput.value)
+				await navigator.clipboard.writeText(url)
 				copy.textContent = '已复制'
 				setTimeout(() => { copy.textContent = '复制链接' }, 2000)
 			})
 			actions.append(copy)
 		}
 
-		uploadButton.addEventListener('click', async () => {
-			if (!pendingFiles.length) {
-				alert('请先选择图片或文件夹')
+		function addPreviewAction(actions, url) {
+			const preview = document.createElement('a')
+			preview.href = url
+			preview.target = '_blank'
+			preview.rel = 'noopener'
+			preview.textContent = '预览 ↗'
+			actions.append(preview)
+		}
+
+		async function uploadImages(files, target, ignored, articleMode) {
+			if (uploadRunning) {
+				driveNoticeMessage('上一批图片仍在处理，请稍候再试', true)
 				return
 			}
-			if (!articleValue) {
-				alert('请先选择或填写图片所属文章')
-				return
-			}
-			uploadButton.disabled = true
-			result.hidden = false
-			resultList.textContent = ''
+			uploadRunning = true
+			uploadQueue.hidden = false
+			uploadQueueList.textContent = ''
+			uploadQueueTitle.textContent = '正在上传到 ' + target + '…'
+			if (ignored)
+				driveNoticeMessage('已忽略 ' + ignored + ' 个非图片文件', false)
 			let pendingCount = 0
 			let duplicateCount = 0
 			let failedCount = 0
-			for (let index = 0; index < pendingFiles.length; index++) {
-				const file = pendingFiles[index]
-				msg.textContent = '正在上传 ' + (index + 1) + ' / ' + pendingFiles.length + '：' + file.name
-				msg.className = 'msg'
-				const item = createResultRow(file)
+			for (let index = 0; index < files.length; index++) {
+				const file = files[index]
+				uploadQueueTitle.textContent = '正在上传 ' + (index + 1) + ' / ' + files.length + '：' + file.name
+				const item = createUploadRow(file)
 				const body = new FormData()
 				body.append('file', file)
-				body.append('article', articleValue)
+				body.append(articleMode ? 'article' : 'folder', target)
 				try {
 					const response = await fetch('/api/upload', { method: 'POST', body })
 					const data = await response.json()
@@ -957,22 +1094,15 @@ function page(request: Request, env: Env): Response {
 						throw new Error(data.error || '上传失败')
 					if (data.status === 'pending') {
 						pendingCount++
-						item.url.value = '等待 owner 批准…'
-						item.note.textContent = '已提交申请（' + data.requestId + '），批准后公开'
-						item.note.className = 'ok'
+						item.status.textContent = '已提交申请，等待批准后公开'
+						item.status.className = 'upload-state ok'
 					}
 					else if (data.status === 'exists') {
 						duplicateCount++
-						item.url.value = data.url
-						item.note.textContent = '图片已存在，链接可直接使用'
-						item.note.className = 'ok'
-						const preview = document.createElement('a')
-						preview.href = data.url
-						preview.target = '_blank'
-						preview.rel = 'noopener'
-						preview.textContent = '预览 ↗'
-						item.actions.append(preview)
-						appendCopyButton(item.actions, item.url)
+						item.status.textContent = '图片已存在，可直接使用'
+						item.status.className = 'upload-state ok'
+						addPreviewAction(item.actions, data.url)
+						addCopyAction(item.actions, data.url)
 					}
 					else {
 						throw new Error('未知上传状态')
@@ -980,13 +1110,10 @@ function page(request: Request, env: Env): Response {
 				}
 				catch (error) {
 					failedCount++
-					item.url.value = ''
-					item.url.placeholder = '上传失败'
-					item.note.textContent = error.message || '上传失败'
-					item.note.className = 'error'
+					item.status.textContent = error.message || '上传失败'
+					item.status.className = 'upload-state error'
 				}
 			}
-			uploadButton.disabled = false
 			const summary = []
 			if (pendingCount)
 				summary.push(pendingCount + ' 张已提交审批')
@@ -994,11 +1121,12 @@ function page(request: Request, env: Env): Response {
 				summary.push(duplicateCount + ' 张已存在复用')
 			if (failedCount)
 				summary.push(failedCount + ' 张失败')
-			msg.textContent = '完成：' + summary.join('，') + '。'
-			msg.className = failedCount ? 'msg error' : 'msg ok'
+			uploadQueueTitle.textContent = '上传到 ' + target + '：' + (summary.join('，') || '没有可上传的图片')
+			driveNoticeMessage('上传到 ' + target + '：' + summary.join('，') + '。', failedCount > 0)
+			uploadRunning = false
 			if (pendingCount)
 				loadRequests()
-		})
+		}
 
 		function formatBytes(bytes) {
 			if (!bytes && bytes !== 0)
@@ -1083,6 +1211,7 @@ function page(request: Request, env: Env): Response {
 
 		function openDriveFolder(folder) {
 			driveFolder = folder
+			hideUploadMenu()
 			driveCursor = ''
 			drivePageFiles = []
 			driveSelected.clear()
