@@ -209,6 +209,8 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 	const extension = newKey.split('.').pop()?.toLowerCase() || ''
 	await env.IMAGES.put(newKey, source.body, {
 		httpMetadata: { contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream' },
+		// 移动/重命名/整目录移动时保留原文件名元数据
+		customMetadata: source.customMetadata,
 	})
 	await env.IMAGES.delete(oldKey)
 	return null
@@ -271,6 +273,8 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
 		await env.IMAGES.put(record.upload.finalKey, staged.body, {
 			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
+			// 保存原始上传文件名，供图片库列表“仅展示原名”使用
+			customMetadata: { originalName: record.upload.originalName },
 		})
 		await env.IMAGES.delete(record.upload.stagedKey)
 	}
@@ -385,7 +389,7 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 		prefix,
 		delimiter: '/',
 		cursor,
-		include: ['httpMetadata'],
+		include: ['httpMetadata', 'customMetadata'],
 	})
 	const truncated = page.truncated
 	const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
@@ -399,6 +403,8 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 			.map(object => ({
 				key: object.key,
 				name: object.key.split('/').pop() || object.key,
+				// 原文件名只在 R2 元数据里，公开 key 仍是内容哈希
+				originalName: object.customMetadata?.originalName || '',
 				size: object.size,
 				uploaded: object.uploaded.toISOString(),
 				contentType: object.httpMetadata?.contentType || '',
@@ -1379,7 +1385,9 @@ function page(request: Request, env: Env): Response {
 			nameBox.className = 'drive-name'
 			const title = document.createElement('div')
 			title.className = 'title'
-			title.textContent = file.name
+			// 优先展示上传时的本地文件名；旧图没有元数据时回退显示哈希文件名
+			title.textContent = file.originalName || file.name
+			title.title = file.key
 			const meta = document.createElement('div')
 			meta.className = 'meta'
 			meta.textContent = file.uploaded ? new Date(file.uploaded).toLocaleString() : ''
