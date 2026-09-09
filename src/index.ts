@@ -165,12 +165,13 @@ function requireIdentity(request: Request, env: Env): (Identity & { email: strin
 
 interface PendingRecord {
 	id: string
-	type: 'upload' | 'delete' | 'move' | 'folder-delete' | 'folder-move'
+	type: 'upload' | 'delete' | 'move' | 'folder-create' | 'folder-delete' | 'folder-move'
 	actorEmail: string
 	createdAt: string
 	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number }
 	delete?: { key: string }
 	move?: { oldKey: string; newKey: string }
+	folderCreate?: { folder: string }
 	folderDelete?: { folder: string }
 	folderMove?: { sourceFolder: string; destFolder: string }
 }
@@ -213,15 +214,17 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 	return null
 }
 
-async function listAllImageKeys(env: Env, prefix: string): Promise<string[]> {
+/**
+ * 列出目录下的全部对象（包括隐藏占位文件）。
+ * 文件夹删除/移动需要连同 .folder 占位一起处理，不能只删图片。
+ */
+async function listAllKeys(env: Env, prefix: string): Promise<string[]> {
 	const keys: string[] = []
 	let cursor: string | undefined
 	do {
 		const page = await env.IMAGES.list({ prefix, limit: 1000, cursor })
-		for (const object of page.objects) {
-			if (IMAGE_KEY_RE.test(object.key))
-				keys.push(object.key)
-		}
+		for (const object of page.objects)
+			keys.push(object.key)
 		if (page.truncated)
 			cursor = page.cursor
 		else
@@ -284,7 +287,7 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 			return json({ error }, 404)
 	}
 	else if (record.type === 'folder-delete' && record.folderDelete) {
-		const keys = await listAllImageKeys(env, `${record.folderDelete.folder}/`)
+		const keys = await listAllKeys(env, `${record.folderDelete.folder}/`)
 		for (const key of keys)
 			await env.IMAGES.delete(key)
 	}
@@ -295,19 +298,45 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 			return json({ error: '文件夹路径无效' }, 400)
 		if (dest === source || dest.startsWith(source + '/'))
 			return json({ error: '不能移动到自身或其子目录' }, 409)
-		const sourceKeys = await listAllImageKeys(env, `${source}/`)
-		const destKeys = new Set(await listAllImageKeys(env, `${dest}/`))
+		const sourceKeys = await listAllKeys(env, `${source}/`)
+		const destKeys = new Set(await listAllKeys(env, `${dest}/`))
+		const markerName = '.folder'
 		for (const key of sourceKeys) {
 			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			// 隐藏占位文件可重复存在于不同目录，不作为冲突；真正的图片冲突才阻止移动
+			if (key.endsWith(`/${markerName}`))
+				continue
 			if (destKeys.has(newKey))
 				return json({ error: `目标目录已有 ${newKey}，请先处理冲突` }, 409)
 		}
 		for (const key of sourceKeys) {
 			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			if (key.endsWith(`/${markerName}`)) {
+				// 目标若已有占位文件则不再重复创建，移动完成后删除旧的即可
+				if (destKeys.has(newKey))
+					await env.IMAGES.delete(key)
+				else
+					await moveObject(env, key, newKey)
+				continue
+			}
 			const error = await moveObject(env, key, newKey)
 			if (error)
 				return json({ error }, 404)
 		}
+	}
+	else if (record.type === 'folder-create' && record.folderCreate) {
+		const folder = record.folderCreate.folder
+		if (!FOLDER_RE.test(folder))
+			return json({ error: '文件夹路径无效' }, 400)
+		const markerKey = `${folder}/.folder`
+		const existing = await env.IMAGES.head(markerKey)
+		if (!existing) {
+			// 没有占位文件但有图片，同样说明目录已存在，不能重复“新建”
+			const probe = await env.IMAGES.list({ prefix: `${folder}/`, limit: 1 })
+			if (probe.objects.length)
+				return json({ error: `目录 ${folder} 已存在` }, 409)
+		}
+		await env.IMAGES.put(markerKey, '', { httpMetadata: { contentType: 'text/plain; charset=utf-8' } })
 	}
 
 	await env.IMAGES.delete(recordKey)
@@ -420,6 +449,11 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		if (body.folder === body.destFolder)
 			return json({ error: '新旧路径相同' }, 400)
 		record = { id, type: 'folder-move', actorEmail: identity.email, createdAt, folderMove: { sourceFolder: body.folder, destFolder: body.destFolder } }
+	}
+	else if (body.action === 'folder-create') {
+		if (!body.folder || !FOLDER_RE.test(body.folder))
+			return json({ error: '文件夹路径无效' }, 400)
+		record = { id, type: 'folder-create', actorEmail: identity.email, createdAt, folderCreate: { folder: body.folder } }
 	}
 	else {
 		return json({ error: '不支持的操作' }, 400)
@@ -539,7 +573,7 @@ function page(request: Request, env: Env): Response {
 	const managementCard = `
 	<div class="card drive-card" id="driveCard">
 		<h2>图片库</h2>
-		<p class="drive-hint">进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
+		<p class="drive-hint">进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。新建文件夹、移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
 		<div class="drive-toolbar">
 			<button type="button" id="driveUp">↑ 返回上级</button>
 			<div id="driveCrumbs" class="drive-crumbs"></div>
@@ -552,6 +586,7 @@ function page(request: Request, env: Env): Response {
 					<button type="button" id="driveUploadFolder">上传文件夹…</button>
 				</div>
 			</div>
+			<button type="button" id="driveNewFolder">＋ 新建文件夹</button>
 			<button type="button" id="driveSelectAll">全选本页</button>
 			<button type="button" id="driveRefresh">刷新</button>
 		</div>
@@ -710,6 +745,7 @@ function page(request: Request, env: Env): Response {
 		const driveCrumbs = document.querySelector('#driveCrumbs')
 		const driveUp = document.querySelector('#driveUp')
 		const driveRefresh = document.querySelector('#driveRefresh')
+		const driveNewFolder = document.querySelector('#driveNewFolder')
 		const driveSelectAll = document.querySelector('#driveSelectAll')
 		const driveSelection = document.querySelector('#driveSelection')
 		const driveSelectedCount = document.querySelector('#driveSelectedCount')
@@ -1219,6 +1255,44 @@ function page(request: Request, env: Env): Response {
 			loadDrive(true)
 		}
 
+		function openNewFolderDialog() {
+			const body = document.createElement('div')
+			const context = driveFolder ? '在「' + driveFolder + '」下' : '在「全部」根目录下'
+			const hint = document.createElement('p')
+			hint.textContent = context + '新建文件夹。R2 不支持真空目录，申请批准后会写入一个隐藏占位文件让空文件夹显示在列表中。'
+			const label = document.createElement('label')
+			label.textContent = '新文件夹编号（1-3 位数字）：'
+			const input = document.createElement('input')
+			input.type = 'text'
+			input.inputMode = 'numeric'
+			input.pattern = '\\d{1,3}'
+			input.maxLength = 3
+			input.style.width = '100%'
+			label.append(document.createElement('br'), input)
+			body.append(hint, label)
+			openDialog('新建文件夹', body, '提交新建申请', async () => {
+				const name = input.value.trim()
+				if (!/^\d{1,3}$/.test(name)) {
+					alert('文件夹编号只能是 1-3 位数字，例如 99')
+					return
+				}
+				const folder = driveFolder ? driveFolder + '/' + name : name
+				driveDialogOk.disabled = true
+				try {
+					const result = await apiPost('/api/file', { action: 'folder-create', folder })
+					driveNoticeMessage('已提交新建文件夹申请：' + folder + '（' + result.requestId + '），等待 owner 批准', false)
+					closeDialog()
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+		}
+
 		function fileActions(file, row) {
 			const actions = document.createElement('div')
 			actions.className = 'drive-actions'
@@ -1680,6 +1754,8 @@ function page(request: Request, env: Env): Response {
 				return '删除：' + request.delete.key
 			if (request.type === 'move' && request.move)
 				return '移动：' + request.move.oldKey + ' → ' + request.move.newKey
+			if (request.type === 'folder-create' && request.folderCreate)
+				return '新建文件夹：' + request.folderCreate.folder + '/'
 			if (request.type === 'folder-delete' && request.folderDelete)
 				return '删除文件夹：' + request.folderDelete.folder + '/'
 			if (request.type === 'folder-move' && request.folderMove)
@@ -1702,6 +1778,14 @@ function page(request: Request, env: Env): Response {
 					try {
 						await apiPost('/api/approve', { requestId: request.id, decision: 'approve' })
 						alert('已批准')
+						if (request.type === 'folder-create' && request.folderCreate) {
+							const created = request.folderCreate.folder
+							const parent = created.includes('/') ? created.slice(0, created.lastIndexOf('/')) : ''
+							openDriveFolder(parent)
+						}
+						else {
+							loadDrive(true)
+						}
 						loadRequests()
 					}
 					catch (error) {
@@ -1760,6 +1844,7 @@ function page(request: Request, env: Env): Response {
 
 		if (driveList) {
 			driveRefresh.addEventListener('click', () => loadDrive(true))
+			driveNewFolder.addEventListener('click', openNewFolderDialog)
 			driveMore.addEventListener('click', () => loadDrive(false))
 			driveUp.addEventListener('click', () => {
 				const index = driveFolder.lastIndexOf('/')
