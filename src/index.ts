@@ -168,7 +168,7 @@ interface PendingRecord {
 	type: 'upload' | 'delete' | 'move' | 'folder-create' | 'folder-delete' | 'folder-move'
 	actorEmail: string
 	createdAt: string
-	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number }
+	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number; sha256?: string }
 	delete?: { key: string }
 	move?: { oldKey: string; newKey: string }
 	folderCreate?: { folder: string }
@@ -273,8 +273,11 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
 		await env.IMAGES.put(record.upload.finalKey, staged.body, {
 			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
-			// 保存原始上传文件名，供图片库列表“仅展示原名”使用
-			customMetadata: { originalName: record.upload.originalName },
+			// 保存原始上传文件名与内容哈希；列表展示原名，同名同内容仍可去重
+			customMetadata: {
+				originalName: record.upload.originalName,
+				...(record.upload.sha256 ? { sha256: record.upload.sha256 } : {}),
+			},
 		})
 		await env.IMAGES.delete(record.upload.stagedKey)
 	}
@@ -469,6 +472,25 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	return json({ ok: true, status: 'pending', requestId: id })
 }
 
+/**
+ * 把上传时的本地文件名清洗成可安全用于 R2 key / URL 的文件名。
+ * 扩展名以内容实际类型为准，防止文件后缀与内容不一致。
+ */
+function storageImageName(originalName: string, mappedExtension: string): string {
+	let base = originalName.trim().replaceAll('\\', '/').split('/').pop() || ''
+	// 去掉路径分隔与常见危险字符（保留中文、空格、横线、下划线等可读字符）
+	base = base.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+		.replace(/\.+$/g, '')
+		.trim()
+	if (!base || base === '.' || base === '..')
+		base = 'image'
+	// 后缀统一按图片真实类型生成，避免 .png 内容却存成 .jpg
+	base = base.replace(/\.[^.]+$/, '').slice(0, 150)
+	if (!base)
+		base = 'image'
+	return `${base}.${mappedExtension}`
+}
+
 async function upload(request: Request, env: Env): Promise<Response> {
 	const identity = requireIdentity(request, env)
 	if (!identity)
@@ -514,9 +536,18 @@ async function upload(request: Request, env: Env): Promise<Response> {
 	const bytes = await file.arrayBuffer()
 	const digest = await crypto.subtle.digest('SHA-256', bytes)
 	const hash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('').slice(0, 16)
-	const finalKey = `${folder}/${hash}.${extension}`
-	const existing = await env.IMAGES.head(finalKey)
 	const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
+
+	// 公开文件名直接使用本地原名；同名但内容不同时追加短哈希避免覆盖
+	let fileName = storageImageName(file.name, extension)
+	let finalKey = `${folder}/${fileName}`
+	let existing = await env.IMAGES.head(finalKey)
+	if (existing && existing.customMetadata?.sha256 !== hash) {
+		const dot = fileName.lastIndexOf('.')
+		fileName = `${fileName.slice(0, dot)}-${hash.slice(0, 8)}${fileName.slice(dot)}`
+		finalKey = `${folder}/${fileName}`
+		existing = await env.IMAGES.head(finalKey)
+	}
 
 	if (existing) {
 		return json({
@@ -535,7 +566,7 @@ async function upload(request: Request, env: Env): Promise<Response> {
 		type: 'upload',
 		actorEmail: identity.email,
 		createdAt: new Date().toISOString(),
-		upload: { stagedKey, finalKey, originalName: file.name, size: file.size },
+		upload: { stagedKey, finalKey, originalName: file.name, size: file.size, sha256: hash },
 	}
 	await writePending(env, record)
 	return json({
