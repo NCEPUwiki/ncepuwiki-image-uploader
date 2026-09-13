@@ -2008,7 +2008,7 @@ function page(request: Request, env: Env): Response {
 				}
 			}
 			if (failures.length)
-				alert('已' + actionText + ' ' + done + ' 条，失败 ' + failures.length + ' 条\n' + failures.join('\n'))
+				alert('已' + actionText + ' ' + done + ' 条，失败 ' + failures.length + ' 条\\n' + failures.join('\\n'))
 			else
 				alert('已' + actionText + ' ' + done + ' 条')
 			loadDrive(true)
