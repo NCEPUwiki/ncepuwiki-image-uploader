@@ -236,6 +236,115 @@ async function listAllKeys(env: Env, prefix: string): Promise<string[]> {
 	return keys
 }
 
+/**
+ * 执行一条已经通过审批的申请。
+ * owner 自己提交申请时会直接调用这里，因此不再需要二次手动批准。
+ */
+async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ error?: string; status?: number }> {
+	if (record.type === 'upload' && record.upload) {
+		if (await env.IMAGES.head(record.upload.finalKey))
+			return { error: '目标位置已有图片，无法重复上传，请改为拒绝', status: 409 }
+		const staged = await env.IMAGES.get(record.upload.stagedKey)
+		if (!staged)
+			return { error: '待上传的图片数据已丢失', status: 404 }
+		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
+		await env.IMAGES.put(record.upload.finalKey, staged.body, {
+			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
+			// 保存原始上传文件名与内容哈希；列表展示原名，同名同内容仍可去重
+			customMetadata: {
+				originalName: record.upload.originalName,
+				...(record.upload.sha256 ? { sha256: record.upload.sha256 } : {}),
+			},
+		})
+		await env.IMAGES.delete(record.upload.stagedKey)
+	}
+	else if (record.type === 'delete' && record.delete) {
+		await env.IMAGES.delete(record.delete.key)
+	}
+	else if (record.type === 'move' && record.move) {
+		if (!validKey(record.move.oldKey) || !validKey(record.move.newKey))
+			return { error: '申请中的图片路径无效', status: 400 }
+		if (record.move.oldKey !== record.move.newKey && await env.IMAGES.head(record.move.newKey))
+			return { error: '目标位置已有同名图片，请先处理冲突', status: 409 }
+		const error = record.move.oldKey === record.move.newKey ? null : await moveObject(env, record.move.oldKey, record.move.newKey)
+		if (error)
+			return { error, status: 404 }
+	}
+	else if (record.type === 'folder-delete' && record.folderDelete) {
+		const keys = await listAllKeys(env, `${record.folderDelete.folder}/`)
+		for (const key of keys)
+			await env.IMAGES.delete(key)
+	}
+	else if (record.type === 'folder-move' && record.folderMove) {
+		const source = record.folderMove.sourceFolder
+		const dest = record.folderMove.destFolder
+		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
+			return { error: '文件夹路径无效', status: 400 }
+		if (dest === source || dest.startsWith(source + '/'))
+			return { error: '不能移动到自身或其子目录', status: 409 }
+		const sourceKeys = await listAllKeys(env, `${source}/`)
+		const destKeys = new Set(await listAllKeys(env, `${dest}/`))
+		const markerName = '.folder'
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			// 隐藏占位文件可重复存在于不同目录，不作为冲突；真正的图片冲突才阻止移动
+			if (key.endsWith(`/${markerName}`))
+				continue
+			if (destKeys.has(newKey))
+				return { error: `目标目录已有 ${newKey}，请先处理冲突`, status: 409 }
+		}
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			if (key.endsWith(`/${markerName}`)) {
+				// 目标若已有占位文件则不再重复创建，移动完成后删除旧的即可
+				if (destKeys.has(newKey))
+					await env.IMAGES.delete(key)
+				else
+					await moveObject(env, key, newKey)
+				continue
+			}
+			const error = await moveObject(env, key, newKey)
+			if (error)
+				return { error, status: 404 }
+		}
+	}
+	else if (record.type === 'folder-create' && record.folderCreate) {
+		const folder = record.folderCreate.folder
+		if (!FOLDER_RE.test(folder))
+			return { error: '文件夹路径无效', status: 400 }
+		const markerKey = `${folder}/.folder`
+		const existing = await env.IMAGES.head(markerKey)
+		if (!existing) {
+			// 没有占位文件但有图片，同样说明目录已存在，不能重复“新建”
+			const probe = await env.IMAGES.list({ prefix: `${folder}/`, limit: 1 })
+			if (probe.objects.length)
+				return { error: `目录 ${folder} 已存在`, status: 409 }
+		}
+		await env.IMAGES.put(markerKey, '', { httpMetadata: { contentType: 'text/plain; charset=utf-8' } })
+	}
+	else if (record.type === 'folder-rename' && record.folderRename) {
+		const source = record.folderRename.folder
+		const dest = record.folderRename.newFolder
+		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
+			return { error: '文件夹路径无效', status: 400 }
+		if (dest === source || dest.startsWith(source + '/'))
+			return { error: '新路径无效', status: 409 }
+		const sourceKeys = await listAllKeys(env, `${source}/`)
+		if (!sourceKeys.length)
+			return { error: '源文件夹不存在或为空', status: 404 }
+		const destKeys = await listAllKeys(env, `${dest}/`)
+		if (destKeys.length)
+			return { error: `目标目录 ${dest} 已存在`, status: 409 }
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const error = await moveObject(env, key, newKey)
+			if (error)
+				return { error, status: 404 }
+		}
+	}
+	return {}
+}
+
 async function approveRequest(request: Request, env: Env): Promise<Response> {
 	const identity = requireIdentity(request, env)
 	if (!identity)
@@ -265,107 +374,9 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 		return json({ ok: true, status: 'rejected' })
 	}
 
-	if (record.type === 'upload' && record.upload) {
-		if (await env.IMAGES.head(record.upload.finalKey))
-			return json({ error: '目标位置已有图片，无法重复上传，请改为拒绝' }, 409)
-		const staged = await env.IMAGES.get(record.upload.stagedKey)
-		if (!staged)
-			return json({ error: '待上传的图片数据已丢失' }, 404)
-		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
-		await env.IMAGES.put(record.upload.finalKey, staged.body, {
-			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
-			// 保存原始上传文件名与内容哈希；列表展示原名，同名同内容仍可去重
-			customMetadata: {
-				originalName: record.upload.originalName,
-				...(record.upload.sha256 ? { sha256: record.upload.sha256 } : {}),
-			},
-		})
-		await env.IMAGES.delete(record.upload.stagedKey)
-	}
-	else if (record.type === 'delete' && record.delete) {
-		await env.IMAGES.delete(record.delete.key)
-	}
-	else if (record.type === 'move' && record.move) {
-		if (!validKey(record.move.oldKey) || !validKey(record.move.newKey))
-			return json({ error: '申请中的图片路径无效' }, 400)
-		if (record.move.oldKey !== record.move.newKey && await env.IMAGES.head(record.move.newKey))
-			return json({ error: '目标位置已有同名图片，请先处理冲突' }, 409)
-		const error = record.move.oldKey === record.move.newKey ? null : await moveObject(env, record.move.oldKey, record.move.newKey)
-		if (error)
-			return json({ error }, 404)
-	}
-	else if (record.type === 'folder-delete' && record.folderDelete) {
-		const keys = await listAllKeys(env, `${record.folderDelete.folder}/`)
-		for (const key of keys)
-			await env.IMAGES.delete(key)
-	}
-	else if (record.type === 'folder-move' && record.folderMove) {
-		const source = record.folderMove.sourceFolder
-		const dest = record.folderMove.destFolder
-		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
-			return json({ error: '文件夹路径无效' }, 400)
-		if (dest === source || dest.startsWith(source + '/'))
-			return json({ error: '不能移动到自身或其子目录' }, 409)
-		const sourceKeys = await listAllKeys(env, `${source}/`)
-		const destKeys = new Set(await listAllKeys(env, `${dest}/`))
-		const markerName = '.folder'
-		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
-			// 隐藏占位文件可重复存在于不同目录，不作为冲突；真正的图片冲突才阻止移动
-			if (key.endsWith(`/${markerName}`))
-				continue
-			if (destKeys.has(newKey))
-				return json({ error: `目标目录已有 ${newKey}，请先处理冲突` }, 409)
-		}
-		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
-			if (key.endsWith(`/${markerName}`)) {
-				// 目标若已有占位文件则不再重复创建，移动完成后删除旧的即可
-				if (destKeys.has(newKey))
-					await env.IMAGES.delete(key)
-				else
-					await moveObject(env, key, newKey)
-				continue
-			}
-			const error = await moveObject(env, key, newKey)
-			if (error)
-				return json({ error }, 404)
-		}
-	}
-	else if (record.type === 'folder-create' && record.folderCreate) {
-		const folder = record.folderCreate.folder
-		if (!FOLDER_RE.test(folder))
-			return json({ error: '文件夹路径无效' }, 400)
-		const markerKey = `${folder}/.folder`
-		const existing = await env.IMAGES.head(markerKey)
-		if (!existing) {
-			// 没有占位文件但有图片，同样说明目录已存在，不能重复“新建”
-			const probe = await env.IMAGES.list({ prefix: `${folder}/`, limit: 1 })
-			if (probe.objects.length)
-				return json({ error: `目录 ${folder} 已存在` }, 409)
-		}
-		await env.IMAGES.put(markerKey, '', { httpMetadata: { contentType: 'text/plain; charset=utf-8' } })
-	}
-	else if (record.type === 'folder-rename' && record.folderRename) {
-		const source = record.folderRename.folder
-		const dest = record.folderRename.newFolder
-		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
-			return json({ error: '文件夹路径无效' }, 400)
-		if (dest === source || dest.startsWith(source + '/'))
-			return json({ error: '新路径无效' }, 409)
-		const sourceKeys = await listAllKeys(env, `${source}/`)
-		if (!sourceKeys.length)
-			return json({ error: '源文件夹不存在或为空' }, 404)
-		const destKeys = await listAllKeys(env, `${dest}/`)
-		if (destKeys.length)
-			return json({ error: `目标目录 ${dest} 已存在` }, 409)
-		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
-			const error = await moveObject(env, key, newKey)
-			if (error)
-				return json({ error }, 404)
-		}
-	}
+	const execution = await executePendingRecord(env, record)
+	if (execution.error)
+		return json({ error: execution.error }, execution.status || 400)
 
 	await env.IMAGES.delete(recordKey)
 	return json({ ok: true, status: 'approved' })
@@ -497,6 +508,27 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	}
 
 	await writePending(env, record)
+	// owner 自己的改动直接生效，不再进入待批准列表
+	if (isAdminIdentity(identity.email, env)) {
+		const execution = await executePendingRecord(env, record)
+		if (execution.error) {
+			if (record.upload)
+				await env.IMAGES.delete(record.upload.stagedKey)
+			await env.IMAGES.delete(`${PENDING_PREFIX}${id}.json`)
+			return json({ error: execution.error }, execution.status || 400)
+		}
+		await env.IMAGES.delete(`${PENDING_PREFIX}${id}.json`)
+		const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
+		const key = record.upload?.finalKey || ''
+		return json({
+			ok: true,
+			status: 'approved',
+			autoApproved: true,
+			requestId: id,
+			key,
+			url: key && baseUrl ? `${baseUrl}/${key}` : '',
+		})
+	}
 	return json({ ok: true, status: 'pending', requestId: id })
 }
 
@@ -597,6 +629,23 @@ async function upload(request: Request, env: Env): Promise<Response> {
 		upload: { stagedKey, finalKey, originalName: file.name, size: file.size, sha256: hash },
 	}
 	await writePending(env, record)
+	// owner 上传直接生效
+	if (isAdminIdentity(identity.email, env)) {
+		const execution = await executePendingRecord(env, record)
+		if (execution.error) {
+			await env.IMAGES.delete(stagedKey)
+			await env.IMAGES.delete(`${PENDING_PREFIX}${id}.json`)
+			return json({ error: execution.error }, execution.status || 400)
+		}
+		await env.IMAGES.delete(`${PENDING_PREFIX}${id}.json`)
+		return json({
+			status: 'approved',
+			autoApproved: true,
+			requestId: id,
+			key: finalKey,
+			url: `${baseUrl}/${finalKey}`,
+		})
+	}
 	return json({
 		status: 'pending',
 		requestId: id,
@@ -1194,6 +1243,7 @@ function page(request: Request, env: Env): Response {
 			if (ignored)
 				driveNoticeMessage('已忽略 ' + ignored + ' 个非图片文件', false)
 			let pendingCount = 0
+			let approvedCount = 0
 			let duplicateCount = 0
 			let failedCount = 0
 			for (let index = 0; index < files.length; index++) {
@@ -1213,6 +1263,15 @@ function page(request: Request, env: Env): Response {
 						item.status.textContent = '已提交申请，等待批准后公开'
 						item.status.className = 'upload-state ok'
 					}
+					else if (data.status === 'approved' || data.autoApproved) {
+						approvedCount++
+						item.status.textContent = '已上传并立即生效'
+						item.status.className = 'upload-state ok'
+						if (data.url) {
+							addPreviewAction(item.actions, data.url)
+							addCopyAction(item.actions, data.url)
+						}
+					}
 					else if (data.status === 'exists') {
 						duplicateCount++
 						item.status.textContent = '图片已存在，可直接使用'
@@ -1231,6 +1290,8 @@ function page(request: Request, env: Env): Response {
 				}
 			}
 			const summary = []
+			if (approvedCount)
+				summary.push(approvedCount + ' 张已直接上传')
 			if (pendingCount)
 				summary.push(pendingCount + ' 张已提交审批')
 			if (duplicateCount)
@@ -1316,10 +1377,11 @@ function page(request: Request, env: Env): Response {
 			let prefix = ''
 			for (const part of parts) {
 				prefix = prefix ? prefix + '/' + part : part
+				const target = prefix
 				const crumb = document.createElement('button')
 				crumb.type = 'button'
 				crumb.textContent = part
-				crumb.addEventListener('click', () => openDriveFolder(prefix))
+				crumb.addEventListener('click', () => openDriveFolder(target))
 				driveCrumbs.append(document.createTextNode(' / '), crumb)
 			}
 			driveUp.disabled = !driveFolder
@@ -1359,7 +1421,14 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					const result = await apiPost('/api/file', { action: 'folder-create', folder })
-					driveNoticeMessage('已提交新建文件夹申请：' + folder + '（' + result.requestId + '），等待 owner 批准', false)
+					if (result.autoApproved) {
+						driveNoticeMessage('已创建文件夹：' + folder, false)
+						const parent = folder.includes('/') ? folder.slice(0, folder.lastIndexOf('/')) : ''
+						openDriveFolder(parent)
+					}
+					else {
+						driveNoticeMessage('已提交新建文件夹申请：' + folder + '（' + result.requestId + '），等待 owner 批准', false)
+					}
 					closeDialog()
 					loadRequests()
 				}
@@ -1402,7 +1471,13 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					const result = await apiPost('/api/file', { action: 'folder-rename', folder, newFolder })
-					driveNoticeMessage('已提交重命名文件夹申请：' + folder + ' → ' + newFolder + '（' + result.requestId + '）', false)
+					if (result.autoApproved) {
+						driveNoticeMessage('已重命名文件夹：' + folder + ' → ' + newFolder, false)
+						loadDrive(true)
+					}
+					else {
+						driveNoticeMessage('已提交重命名文件夹申请：' + folder + ' → ' + newFolder + '（' + result.requestId + '）', false)
+					}
 					closeDialog()
 					loadRequests()
 				}
@@ -1668,11 +1743,14 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					let count = 0
+					let autoApproved = 0
 					for (const file of files) {
-						await apiPost('/api/file', { action: 'delete', key: file.key })
+						const result = await apiPost('/api/file', { action: 'delete', key: file.key })
 						count++
+						if (result.autoApproved)
+							autoApproved++
 					}
-					driveNoticeMessage('已提交 ' + count + ' 条删除申请，等待 owner 批准', false)
+					driveNoticeMessage(autoApproved === count ? '已直接删除 ' + count + ' 张图片' : '已提交 ' + count + ' 条删除申请，等待 owner 批准', false)
 					closeDialog()
 					driveSelected.clear()
 					updateDriveSelectionUI()
@@ -1699,7 +1777,13 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					const result = await apiPost('/api/file', { action: 'folder-delete', folder })
-					driveNoticeMessage('已提交删除文件夹申请：' + result.requestId, false)
+					if (result.autoApproved) {
+						driveNoticeMessage('已删除文件夹：' + folder, false)
+						loadDrive(true)
+					}
+					else {
+						driveNoticeMessage('已提交删除文件夹申请：' + result.requestId, false)
+					}
 					closeDialog()
 					loadRequests()
 				}
@@ -1713,16 +1797,17 @@ function page(request: Request, env: Env): Response {
 		}
 
 		function openRenameDialog(file) {
+			const displayName = file.originalName || file.name
 			const body = document.createElement('div')
 			const input = document.createElement('input')
 			input.type = 'text'
-			input.value = file.name
+			input.value = displayName
 			input.style.width = '100%'
 			body.append(input)
-			openDialog('重命名 ' + file.name, body, '提交重命名申请', async () => {
+			openDialog('重命名 ' + displayName, body, '提交重命名申请', async () => {
 				const newName = input.value.trim()
 				const parent = file.key.slice(0, file.key.lastIndexOf('/'))
-				if (!newName || newName === file.name) {
+				if (!newName || newName === displayName) {
 					alert('请输入新文件名')
 					return
 				}
@@ -1732,7 +1817,13 @@ function page(request: Request, env: Env): Response {
 				}
 				try {
 					const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent + '/' + newName })
-					driveNoticeMessage('已提交重命名申请：' + result.requestId, false)
+					if (result.autoApproved) {
+						driveNoticeMessage('已重命名：' + displayName + ' → ' + newName, false)
+						loadDrive(true)
+					}
+					else {
+						driveNoticeMessage('已提交重命名申请：' + result.requestId, false)
+					}
 					closeDialog()
 					loadRequests()
 				}
@@ -1823,14 +1914,17 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					let count = 0
+					let autoApproved = 0
 					for (const file of moveTargetFiles) {
 						const newKey = moveDestination + '/' + file.name
 						if (newKey !== file.key) {
-							await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey })
+							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey })
 							count++
+							if (result.autoApproved)
+								autoApproved++
 						}
 					}
-					driveNoticeMessage('已提交 ' + count + ' 条移动申请，等待 owner 批准', false)
+					driveNoticeMessage(autoApproved === count ? '已直接移动 ' + count + ' 张图片' : '已提交 ' + count + ' 条移动申请，等待 owner 批准', false)
 					closeDialog()
 					driveSelected.clear()
 					updateDriveSelectionUI()
@@ -1871,7 +1965,7 @@ function page(request: Request, env: Env): Response {
 				driveDialogOk.disabled = true
 				try {
 					const result = await apiPost('/api/file', { action: 'folder-move', folder: moveSourceFolder, destFolder: moveDestination })
-					driveNoticeMessage('已提交移动文件夹申请：' + result.requestId, false)
+					driveNoticeMessage(result.autoApproved ? '已移动文件夹到 ' + moveDestination : '已提交移动文件夹申请：' + result.requestId, false)
 					closeDialog()
 					loadDrive(true)
 					loadRequests()
