@@ -165,13 +165,14 @@ function requireIdentity(request: Request, env: Env): (Identity & { email: strin
 
 interface PendingRecord {
 	id: string
-	type: 'upload' | 'delete' | 'move' | 'folder-create' | 'folder-delete' | 'folder-move'
+	type: 'upload' | 'delete' | 'move' | 'folder-create' | 'folder-rename' | 'folder-delete' | 'folder-move'
 	actorEmail: string
 	createdAt: string
 	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number; sha256?: string }
 	delete?: { key: string }
 	move?: { oldKey: string; newKey: string }
 	folderCreate?: { folder: string }
+	folderRename?: { folder: string; newFolder: string }
 	folderDelete?: { folder: string }
 	folderMove?: { sourceFolder: string; destFolder: string }
 }
@@ -345,6 +346,26 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 		}
 		await env.IMAGES.put(markerKey, '', { httpMetadata: { contentType: 'text/plain; charset=utf-8' } })
 	}
+	else if (record.type === 'folder-rename' && record.folderRename) {
+		const source = record.folderRename.folder
+		const dest = record.folderRename.newFolder
+		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
+			return json({ error: '文件夹路径无效' }, 400)
+		if (dest === source || dest.startsWith(source + '/'))
+			return json({ error: '新路径无效' }, 409)
+		const sourceKeys = await listAllKeys(env, `${source}/`)
+		if (!sourceKeys.length)
+			return json({ error: '源文件夹不存在或为空' }, 404)
+		const destKeys = await listAllKeys(env, `${dest}/`)
+		if (destKeys.length)
+			return json({ error: `目标目录 ${dest} 已存在` }, 409)
+		for (const key of sourceKeys) {
+			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const error = await moveObject(env, key, newKey)
+			if (error)
+				return json({ error }, 404)
+		}
+	}
 
 	await env.IMAGES.delete(recordKey)
 	return json({ ok: true, status: 'approved' })
@@ -423,7 +444,7 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
-	let body: { action?: string; key?: string; oldKey?: string; newKey?: string; folder?: string; destFolder?: string }
+	let body: { action?: string; key?: string; oldKey?: string; newKey?: string; folder?: string; newFolder?: string; destFolder?: string }
 	try {
 		body = await request.json() as typeof body
 	}
@@ -463,6 +484,13 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		if (!body.folder || !FOLDER_RE.test(body.folder))
 			return json({ error: '文件夹路径无效' }, 400)
 		record = { id, type: 'folder-create', actorEmail: identity.email, createdAt, folderCreate: { folder: body.folder } }
+	}
+	else if (body.action === 'folder-rename') {
+		if (!body.folder || !body.newFolder || !FOLDER_RE.test(body.folder) || !FOLDER_RE.test(body.newFolder))
+			return json({ error: '文件夹路径无效' }, 400)
+		if (body.folder === body.newFolder)
+			return json({ error: '新旧路径相同' }, 400)
+		record = { id, type: 'folder-rename', actorEmail: identity.email, createdAt, folderRename: { folder: body.folder, newFolder: body.newFolder } }
 	}
 	else {
 		return json({ error: '不支持的操作' }, 400)
@@ -673,6 +701,13 @@ function page(request: Request, env: Env): Response {
 	const approvalCard = isAdmin ? `
 	<div class="card">
 		<h2>待批准（owner）</h2>
+		<div class="drive-toolbar approval-toolbar">
+			<button type="button" id="approvalSelectAll">全选</button>
+			<button type="button" id="approvalApproveAll">一键批准全部</button>
+			<button type="button" id="approvalRejectAll">一键拒绝全部</button>
+			<button type="button" id="approvalApproveSelected">批准选中</button>
+			<button type="button" id="approvalRejectSelected">拒绝选中</button>
+		</div>
 		<div id="approvalList"></div>
 		<p><button type="button" id="approvalRefresh">刷新</button></p>
 	</div>` : ''
@@ -688,6 +723,7 @@ function page(request: Request, env: Env): Response {
 		body { font-family: system-ui, sans-serif; max-width: 900px; margin: 48px auto; padding: 0 20px; }
 		.card { border: 1px solid #ccc; border-radius: 12px; padding: 24px; }
 		.result-item { border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+		.approval-check { margin: 0 8px 0 0; vertical-align: top; }
 		.result-item .row-url { width: 100%; box-sizing: border-box; font-size: 12px; }
 		.result-item .row-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
 		button { cursor: pointer; }
@@ -803,6 +839,11 @@ function page(request: Request, env: Env): Response {
 		const myReqRefresh = document.querySelector('#myReqRefresh')
 		const approvalList = document.querySelector('#approvalList')
 		const approvalRefresh = document.querySelector('#approvalRefresh')
+		const approvalSelectAll = document.querySelector('#approvalSelectAll')
+		const approvalApproveAll = document.querySelector('#approvalApproveAll')
+		const approvalRejectAll = document.querySelector('#approvalRejectAll')
+		const approvalApproveSelected = document.querySelector('#approvalApproveSelected')
+		const approvalRejectSelected = document.querySelector('#approvalRejectSelected')
 
 		let allArticles = []
 		let driveFolder = ''
@@ -810,6 +851,8 @@ function page(request: Request, env: Env): Response {
 		let driveLoading = false
 		let drivePageFiles = []
 		let driveSelected = new Map()
+		let approvalSelected = new Set()
+		let approvalRequests = []
 		let uploadRunning = false
 		let dragDepth = 0
 
@@ -1329,6 +1372,49 @@ function page(request: Request, env: Env): Response {
 			})
 		}
 
+		function openRenameFolderDialog(folder) {
+			const parent = folder.includes('/') ? folder.slice(0, folder.lastIndexOf('/')) : ''
+			const current = folder.split('/').pop() || folder
+			const body = document.createElement('div')
+			const hint = document.createElement('p')
+			hint.textContent = '重命名文件夹「' + folder + '」，只修改最后一级编号。'
+			const label = document.createElement('label')
+			label.textContent = '新编号（1-3 位数字）：'
+			const input = document.createElement('input')
+			input.type = 'text'
+			input.inputMode = 'numeric'
+			input.maxLength = 3
+			input.value = current
+			input.style.width = '100%'
+			label.append(document.createElement('br'), input)
+			body.append(hint, label)
+			openDialog('重命名文件夹', body, '提交重命名申请', async () => {
+				const name = input.value.trim()
+				if (!/^\\d{1,3}$/.test(name)) {
+					alert('文件夹编号只能是 1-3 位数字')
+					return
+				}
+				const newFolder = parent ? parent + '/' + name : name
+				if (newFolder === folder) {
+					alert('新旧编号相同')
+					return
+				}
+				driveDialogOk.disabled = true
+				try {
+					const result = await apiPost('/api/file', { action: 'folder-rename', folder, newFolder })
+					driveNoticeMessage('已提交重命名文件夹申请：' + folder + ' → ' + newFolder + '（' + result.requestId + '）', false)
+					closeDialog()
+					loadRequests()
+				}
+				catch (error) {
+					alert(error.message)
+				}
+				finally {
+					driveDialogOk.disabled = false
+				}
+			})
+		}
+
 		function fileActions(file, row) {
 			const actions = document.createElement('div')
 			actions.className = 'drive-actions'
@@ -1371,6 +1457,11 @@ function page(request: Request, env: Env): Response {
 			open.textContent = '打开'
 			open.addEventListener('click', () => openDriveFolder(folder))
 			actions.append(open)
+			const rename = document.createElement('button')
+			rename.type = 'button'
+			rename.textContent = '重命名'
+			rename.addEventListener('click', () => openRenameFolderDialog(folder))
+			actions.append(rename)
 			const move = document.createElement('button')
 			move.type = 'button'
 			move.textContent = '移动'
@@ -1526,6 +1617,7 @@ function page(request: Request, env: Env): Response {
 			}
 			else {
 				addButton(driveContext, '打开文件夹', () => { hideDriveContext(); openDriveFolder(target.folder) }).type = 'button'
+				addButton(driveContext, '重命名文件夹', () => { hideDriveContext(); openRenameFolderDialog(target.folder) }).type = 'button'
 				addButton(driveContext, '移动文件夹', () => { hideDriveContext(); openMoveFolderDialog(target.folder) }).type = 'button'
 				addButton(driveContext, '删除文件夹', () => { hideDriveContext(); openDeleteFolderDialog(target.folder) }).type = 'button'
 			}
@@ -1660,40 +1752,48 @@ function page(request: Request, env: Env): Response {
 			}
 		}
 
-		function renderMoveLevel(prefix) {
-			const children = childrenOf(prefix)
+		async function renderMoveLevel(prefix) {
 			const element = document.createElement('div')
 			element.className = 'article-level'
 			const label = document.createElement('span')
 			label.className = 'level-label'
-			label.textContent = prefix.length ? '第 ' + (prefix.length + 1) + ' 级' : '第 1 级'
+			label.textContent = prefix ? '当前：' + prefix : '选择存储里的目录：'
 			const select = document.createElement('select')
 			select.className = 'level-select'
 			addOption(select, '请选择…', '')
-			for (const folder of children.folders)
-				addOption(select, '📁 ' + folder, 'dir:' + folder)
-			for (const article of children.articles)
-				addOption(select, '📄 ' + article, 'art:' + article)
+			if (prefix)
+				addOption(select, '✅ 移动到此目录', 'dest:' + prefix)
 			const index = moveLevels.length
 			moveLevels.push({ element, prefix })
 			element.append(label, select)
 			movePickerBody.append(element)
-			select.addEventListener('change', () => {
+			try {
+				const data = await apiGet('/api/files?folder=' + encodeURIComponent(prefix))
+				for (const folder of data.folders || []) {
+					if (moveSourceFolder && (folder === moveSourceFolder || folder.startsWith(moveSourceFolder + '/')))
+						continue
+					const name = prefix ? folder.slice(prefix.length + 1) : folder
+					addOption(select, '📁 ' + name, 'dir:' + folder)
+				}
+			}
+			catch (error) {
+				const failed = document.createElement('small')
+				failed.textContent = '目录加载失败：' + (error.message || '未知错误')
+				element.append(failed)
+			}
+			select.addEventListener('change', async () => {
 				if (!select.value)
 					return
 				const value = select.value.slice(4)
-				const isArticle = select.value.startsWith('art:')
 				clearMoveLevelsFrom(index + 1)
-				if (isArticle) {
-					const full = prefix.concat(value)
-					const digits = full.map(part => (part.match(/^\\d+/) || [''])[0]).filter(Boolean).join('/')
-					moveDestination = digits
-					moveDestNote.textContent = '将移动到：' + full.join(' / ') + '（' + digits + '）'
+				if (select.value.startsWith('dest:')) {
+					moveDestination = value
+					moveDestNote.textContent = '将移动到：' + value
 				}
 				else {
-					moveDestination = ''
-					moveDestNote.textContent = ''
-					renderMoveLevel(prefix.concat(value))
+					moveDestination = value
+					moveDestNote.textContent = '将移动到：' + value + '（可继续选择更深目录）'
+					await renderMoveLevel(value)
 				}
 			})
 		}
@@ -1705,6 +1805,7 @@ function page(request: Request, env: Env): Response {
 
 		function openMoveDialog(files) {
 			moveTargetFiles = files
+			moveSourceFolder = ''
 			moveDestination = ''
 			moveLevels = []
 			const body = document.createElement('div')
@@ -1716,7 +1817,7 @@ function page(request: Request, env: Env): Response {
 			body.append(hint, movePickerBody, moveDestNote)
 			openDialog('申请移动', body, '提交移动申请', async () => {
 				if (!moveDestination) {
-					alert('请先逐级选择目标文章目录')
+					alert('请先选择存储里的目标目录')
 					return
 				}
 				driveDialogOk.disabled = true
@@ -1760,7 +1861,7 @@ function page(request: Request, env: Env): Response {
 			body.append(hint, movePickerBody, moveDestNote)
 			openDialog('申请移动文件夹', body, '提交移动申请', async () => {
 				if (!moveDestination) {
-					alert('请先逐级选择目标文章目录')
+					alert('请先选择存储里的目标目录')
 					return
 				}
 				if (moveDestination === moveSourceFolder || moveDestination.startsWith(moveSourceFolder + '/')) {
@@ -1794,6 +1895,8 @@ function page(request: Request, env: Env): Response {
 				return '移动：' + request.move.oldKey + ' → ' + request.move.newKey
 			if (request.type === 'folder-create' && request.folderCreate)
 				return '新建文件夹：' + request.folderCreate.folder + '/'
+			if (request.type === 'folder-rename' && request.folderRename)
+				return '重命名文件夹：' + request.folderRename.folder + '/ → ' + request.folderRename.newFolder + '/'
 			if (request.type === 'folder-delete' && request.folderDelete)
 				return '删除文件夹：' + request.folderDelete.folder + '/'
 			if (request.type === 'folder-move' && request.folderMove)
@@ -1804,6 +1907,20 @@ function page(request: Request, env: Env): Response {
 		function appendRequestRow(container, request, allowAction) {
 			const row = document.createElement('div')
 			row.className = 'result-item'
+			if (allowAction) {
+				const check = document.createElement('input')
+				check.type = 'checkbox'
+				check.className = 'approval-check'
+				check.dataset.requestId = request.id
+				check.checked = approvalSelected.has(request.id)
+				check.addEventListener('change', () => {
+					if (check.checked)
+						approvalSelected.add(request.id)
+					else
+						approvalSelected.delete(request.id)
+				})
+				row.append(check)
+			}
 			const head = document.createElement('div')
 			head.textContent = '#' + request.id + '  ' + requestDescription(request)
 			const meta = document.createElement('small')
@@ -1856,6 +1973,8 @@ function page(request: Request, env: Env): Response {
 
 				if (approvalList) {
 					const all = await apiGet('/api/requests')
+					approvalRequests = all.requests
+					approvalSelected.clear()
 					approvalList.textContent = ''
 					if (!all.requests.length)
 						approvalList.append(Object.assign(document.createElement('p'), { textContent: '暂无待批准的申请' }))
@@ -1866,6 +1985,34 @@ function page(request: Request, env: Env): Response {
 			catch (error) {
 				alert(error.message || '申请列表加载失败')
 			}
+		}
+
+		async function processApprovalBatch(requests, decision) {
+			if (!requests.length) {
+				alert(decision === 'approve' ? '没有可批准的申请' : '没有可拒绝的申请')
+				return
+			}
+			const actionText = decision === 'approve' ? '批准' : '拒绝'
+			if (!confirm('确定一键' + actionText + ' ' + requests.length + ' 条申请吗？'))
+				return
+			let done = 0
+			const failures = []
+			for (const request of requests) {
+				try {
+					await apiPost('/api/approve', { requestId: request.id, decision })
+					done++
+					approvalSelected.delete(request.id)
+				}
+				catch (error) {
+					failures.push('#' + request.id + '：' + (error.message || '失败'))
+				}
+			}
+			if (failures.length)
+				alert('已' + actionText + ' ' + done + ' 条，失败 ' + failures.length + ' 条\n' + failures.join('\n'))
+			else
+				alert('已' + actionText + ' ' + done + ' 条')
+			loadDrive(true)
+			loadRequests()
 		}
 
 		function syncDriveRows() {
@@ -1921,6 +2068,23 @@ function page(request: Request, env: Env): Response {
 			myReqRefresh.addEventListener('click', loadRequests)
 		if (approvalRefresh)
 			approvalRefresh.addEventListener('click', loadRequests)
+		if (approvalSelectAll) {
+			approvalSelectAll.addEventListener('click', () => {
+				const allSelected = approvalRequests.length > 0 && approvalRequests.every(request => approvalSelected.has(request.id))
+				if (allSelected)
+					approvalSelected.clear()
+				else
+					for (const request of approvalRequests)
+						approvalSelected.add(request.id)
+				for (const check of approvalList.querySelectorAll('.approval-check')) {
+					check.checked = approvalSelected.has(check.dataset.requestId)
+				}
+			})
+			approvalApproveAll.addEventListener('click', () => processApprovalBatch(approvalRequests, 'approve'))
+			approvalRejectAll.addEventListener('click', () => processApprovalBatch(approvalRequests, 'reject'))
+			approvalApproveSelected.addEventListener('click', () => processApprovalBatch(approvalRequests.filter(request => approvalSelected.has(request.id)), 'approve'))
+			approvalRejectSelected.addEventListener('click', () => processApprovalBatch(approvalRequests.filter(request => approvalSelected.has(request.id)), 'reject'))
+		}
 		loadRequests()
 	</script>
 </body>
