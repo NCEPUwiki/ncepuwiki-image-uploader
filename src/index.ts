@@ -3,6 +3,8 @@ export interface Env {
 	IMAGE_BASE_URL: string
 	REQUIRE_AUTH?: string
 	ADMIN_EMAILS?: string
+	ACCESS_TEAM_DOMAIN?: string
+	ACCESS_AUD?: string
 }
 
 const ALLOWED_TYPES: Record<string, string> = {
@@ -25,6 +27,22 @@ const MIME_BY_EXT: Record<string, string> = {
 	avif: 'image/avif',
 }
 
+/**
+ * 公开图片的缓存策略：关闭边缘缓存，浏览器每次校验。
+ *
+ * img.ncepuinfo.cc 是 R2 自定义域名：对象不写 Cache-Control 时 Cloudflare 按默认
+ * 4 小时（max-age=14400）缓存，删除后重新上传同名文件时 URL 不变，浏览器和边缘
+ * 节点就会继续返回旧图。
+ *
+ * 实测该域名下 Cloudflare 会把公开响应的 max-age 统一改写成 14400
+ * （no-cache、max-age=0、public, max-age=60 都无效），只有 private / no-store
+ * 能原样返回并让边缘 cf-cache-status 变成 BYPASS。
+ *
+ * 所以这里用 private, max-age=0, must-revalidate：边缘不缓存，浏览器每次带
+ * ETag 校验（内容没变返回 304，省流量），换图后 ETag 变化立即拿到新内容。
+ */
+const PUBLIC_CACHE_CONTROL = 'private, max-age=0, must-revalidate'
+
 interface Identity {
 	email?: string
 	name?: string
@@ -38,7 +56,7 @@ export default {
 			return page(request, env)
 
 		if (request.method === 'GET' && url.pathname === '/api/me')
-			return json({ identity: identityOf(request), requireAuth: isAuthRequired(env) })
+			return json({ identity: await identityOf(request, env), requireAuth: isAuthRequired(env) })
 
 		if (request.method === 'GET' && url.pathname === '/api/articles')
 			return json({ articles: await articleOptions() })
@@ -66,17 +84,171 @@ function isAuthRequired(env: Env): boolean {
 	return env.REQUIRE_AUTH === 'true'
 }
 
-function identityOf(request: Request): Identity {
-	const token = request.headers.get('CF-Access-Jwt-Assertion')
+/** Cloudflare Access 应用配置：团队域名与 Application Audience (AUD)。 */
+const ACCESS_TEAM_DOMAIN_DEFAULT = 'https://ncepuwiki.cloudflareaccess.com'
+const ACCESS_AUD_DEFAULT = '611b1c0247488b8e43511c4067980306c89afd3a8305769957e37f2fcbb9daaa'
+/** 允许的时钟偏差（秒），避免刚签发的 token 因设备时间略慢被拒。 */
+const ACCESS_CLOCK_SKEW = 60
+const ACCESS_JWKS_TTL_MS = 60 * 60 * 1000
+const ACCESS_JWKS_MIN_REFRESH_MS = 60 * 1000
+
+function accessSettings(env: Env): { teamDomain: string; aud: string } {
+	return {
+		teamDomain: (env.ACCESS_TEAM_DOMAIN || ACCESS_TEAM_DOMAIN_DEFAULT).replace(/\/+$/, ''),
+		aud: env.ACCESS_AUD || ACCESS_AUD_DEFAULT,
+	}
+}
+
+interface AccessClaims {
+	email?: string
+	name?: string
+	aud?: string | string[]
+	iss?: string
+	exp?: number
+	nbf?: number
+}
+
+interface AccessJwk {
+	kid?: string
+	n?: string
+	e?: string
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+	const base64 = value.replaceAll('-', '+').replaceAll('_', '/')
+	const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=')
+	const raw = atob(padded)
+	const bytes = new Uint8Array(raw.length)
+	for (let index = 0; index < raw.length; index++)
+		bytes[index] = raw.charCodeAt(index)
+	return bytes
+}
+
+function base64UrlToText(value: string): string {
+	return new TextDecoder().decode(base64UrlToBytes(value))
+}
+
+/** 校验不通过时返回 null；只有走了 Access 的合法 token 才能拿到身份。 */
+function accessReject(reason: string): null {
+	console.warn(`[access] JWT 校验失败：${reason}`)
+	return null
+}
+
+async function verifyAccessToken(token: string, env: Env): Promise<Identity | null> {
+	const parts = token.split('.')
+	if (parts.length !== 3)
+		return accessReject('格式不是 JWT')
+	const [headerPart, payloadPart, signaturePart] = parts
+	let header: { alg?: string, kid?: string }
+	let claims: AccessClaims
+	try {
+		header = JSON.parse(base64UrlToText(headerPart)) as typeof header
+		claims = JSON.parse(base64UrlToText(payloadPart)) as AccessClaims
+	}
+	catch {
+		return accessReject('payload 解析失败')
+	}
+	if (header.alg !== 'RS256' || !header.kid)
+		return accessReject(`header 无效（alg=${header.alg}）`)
+
+	const { teamDomain, aud } = accessSettings(env)
+	const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud]
+	if (claims.iss !== teamDomain)
+		return accessReject(`iss 不匹配：${claims.iss}（期望 ${teamDomain}）`)
+	if (!audiences.includes(aud))
+		return accessReject(`aud 不匹配：${audiences.join(',')}（期望 ${aud}）`)
+
+	const now = Math.floor(Date.now() / 1000)
+	if (typeof claims.exp !== 'number' || claims.exp + ACCESS_CLOCK_SKEW <= now)
+		return accessReject('token 已过期')
+	if (typeof claims.nbf === 'number' && claims.nbf - ACCESS_CLOCK_SKEW > now)
+		return accessReject('token 还没生效')
+
+	const keys = await accessPublicKeys(env)
+	let jwk = keys.find(key => key.kid === header.kid)
+	if (!jwk && Date.now() - (accessKeysCache?.fetchedAt || 0) > ACCESS_JWKS_MIN_REFRESH_MS) {
+		// Access 轮换公钥后旧缓存里可能没有新 kid，这里强制刷新一次；
+		// 用最小刷新间隔兜住伪造 kid 触发的重复请求
+		jwk = (await accessPublicKeys(env, true)).find(key => key.kid === header.kid)
+	}
+	if (!jwk?.n || !jwk.e)
+		return accessReject(`找不到公钥 kid=${header.kid}`)
+	const key = await crypto.subtle.importKey(
+		'jwk',
+		{ kty: 'RSA', n: jwk.n, e: jwk.e, alg: 'RS256', ext: true },
+		{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+		false,
+		['verify'],
+	)
+	const valid = await crypto.subtle.verify(
+		'RSASSA-PKCS1-v1_5',
+		key,
+		base64UrlToBytes(signaturePart),
+		new TextEncoder().encode(`${headerPart}.${payloadPart}`),
+	)
+	if (!valid)
+		return accessReject('签名不匹配')
+	return {
+		email: typeof claims.email === 'string' ? claims.email : undefined,
+		name: typeof claims.name === 'string' ? claims.name : claims.email,
+	}
+}
+
+let accessKeysCache: { fetchedAt: number; keys: AccessJwk[] } | null = null
+
+async function accessPublicKeys(env: Env, force = false): Promise<AccessJwk[]> {
+	if (!force && accessKeysCache && Date.now() - accessKeysCache.fetchedAt < ACCESS_JWKS_TTL_MS)
+		return accessKeysCache.keys
+	const { teamDomain } = accessSettings(env)
+	try {
+		const response = await fetch(`${teamDomain}/cdn-cgi/access/certs`, {
+			headers: { Accept: 'application/json' },
+		})
+		if (!response.ok)
+			throw new Error(`Access 公钥获取失败：${response.status}`)
+		const data = await response.json() as { keys?: AccessJwk[] }
+		const keys = (data.keys || []).filter(key => Boolean(key.kid && key.n && key.e))
+		if (!keys.length)
+			throw new Error('Access 公钥为空')
+		accessKeysCache = { fetchedAt: Date.now(), keys }
+		return keys
+	}
+	catch (error) {
+		// 拉取失败时退回上一次的公钥，避免 Access 抖动导致所有人都登录不了
+		if (accessKeysCache)
+			return accessKeysCache.keys
+		throw error
+	}
+}
+
+function accessToken(request: Request): string {
+	const header = request.headers.get('CF-Access-Jwt-Assertion')
+	if (header)
+		return header
+	// 浏览器请求也可能只带 Access 的 cookie（例如直接访问页面）
+	const cookies = request.headers.get('Cookie') || ''
+	for (const entry of cookies.split(';')) {
+		const [name, ...rest] = entry.trim().split('=')
+		if (name === 'CF_Authorization')
+			return rest.join('=').trim()
+	}
+	return ''
+}
+
+/**
+ * 用户身份。启用 Access（REQUIRE_AUTH=true）时必须验签：
+ * 只信任 Cloudflare Access 用 RS256 签发、且 iss/aud/exp 都对得上的 token，
+ * 光伪造一个 CF-Access-Jwt-Assertion 头不再能冒充 owner。
+ * 本地开发（REQUIRE_AUTH 不为 true）没有 Access 可验，退化为直接读 payload。
+ */
+async function identityOf(request: Request, env: Env): Promise<Identity> {
+	const token = accessToken(request)
 	if (!token)
 		return {}
+	if (isAuthRequired(env))
+		return (await verifyAccessToken(token, env)) || {}
 	try {
-		const payload = token.split('.')[1]
-		const base64 = payload.replaceAll('-', '+').replaceAll('_', '/')
-		const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=')
-		const raw = atob(padded)
-		const bytes = Uint8Array.from(raw, char => char.charCodeAt(0))
-		const claims = JSON.parse(new TextDecoder().decode(bytes)) as { email?: string, name?: string }
+		const claims = JSON.parse(base64UrlToText(token.split('.')[1] || '')) as AccessClaims
 		return { email: claims.email, name: claims.name || claims.email }
 	}
 	catch {
@@ -156,10 +328,8 @@ function isAdminIdentity(email: string | undefined, env: Env): boolean {
 	return admins.length > 0 && admins.includes(email.toLowerCase())
 }
 
-function requireIdentity(request: Request, env: Env): (Identity & { email: string }) | null {
-	if (isAuthRequired(env) && !request.headers.has('CF-Access-Jwt-Assertion'))
-		return null
-	const identity = identityOf(request)
+async function requireIdentity(request: Request, env: Env): Promise<(Identity & { email: string }) | null> {
+	const identity = await identityOf(request, env)
 	return identity.email ? { email: identity.email, name: identity.name } : null
 }
 
@@ -209,7 +379,10 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 		return '源图片不存在'
 	const extension = newKey.split('.').pop()?.toLowerCase() || ''
 	await env.IMAGES.put(newKey, source.body, {
-		httpMetadata: { contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream' },
+		httpMetadata: {
+			contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream',
+			cacheControl: PUBLIC_CACHE_CONTROL,
+		},
 		// 移动/重命名/整目录移动时保留原文件名元数据
 		customMetadata: source.customMetadata,
 	})
@@ -249,7 +422,10 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 			return { error: '待上传的图片数据已丢失', status: 404 }
 		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
 		await env.IMAGES.put(record.upload.finalKey, staged.body, {
-			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
+			httpMetadata: {
+				contentType: MIME_BY_EXT[extension] || 'application/octet-stream',
+				cacheControl: PUBLIC_CACHE_CONTROL,
+			},
 			// 保存原始上传文件名与内容哈希；列表展示原名，同名同内容仍可去重
 			customMetadata: {
 				originalName: record.upload.originalName,
@@ -346,7 +522,7 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 }
 
 async function approveRequest(request: Request, env: Env): Promise<Response> {
-	const identity = requireIdentity(request, env)
+	const identity = await requireIdentity(request, env)
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 	if (!isAdminIdentity(identity.email, env))
@@ -383,7 +559,7 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 }
 
 async function listRequests(request: Request, env: Env): Promise<Response> {
-	const identity = requireIdentity(request, env)
+	const identity = await requireIdentity(request, env)
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
@@ -409,7 +585,7 @@ async function listRequests(request: Request, env: Env): Promise<Response> {
 }
 
 async function listFiles(request: Request, env: Env): Promise<Response> {
-	const identity = requireIdentity(request, env)
+	const identity = await requireIdentity(request, env)
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
@@ -451,7 +627,7 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 }
 
 async function fileAction(request: Request, env: Env): Promise<Response> {
-	const identity = requireIdentity(request, env)
+	const identity = await requireIdentity(request, env)
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
@@ -552,7 +728,7 @@ function storageImageName(originalName: string, mappedExtension: string): string
 }
 
 async function upload(request: Request, env: Env): Promise<Response> {
-	const identity = requireIdentity(request, env)
+	const identity = await requireIdentity(request, env)
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
@@ -680,8 +856,8 @@ function articleFolder(input: string): string | null {
 	return folder.length <= 100 ? folder : null
 }
 
-function page(request: Request, env: Env): Response {
-	const identity = identityOf(request)
+async function page(request: Request, env: Env): Promise<Response> {
+	const identity = await identityOf(request, env)
 	const email = identity.email ? `<span id="email">${escapeHtml(identity.email)}</span>` : '<span id="email">未登录（尚未启用 Access）</span>'
 	const isAdmin = isAdminIdentity(identity.email, env)
 	const managementCard = `

@@ -66,6 +66,7 @@
 2. `IMAGE_BASE_URL`：改成图片公开域名（示例 `https://img.ncepuinfo.cc`）。
 3. `REQUIRE_AUTH`：套上 Cloudflare Access 之前保持 `"false"`，配置好后再改成 `"true"`。
 4. `ADMIN_EMAILS`：填写 NCEPUwiki GitHub 组织 owner 的登录邮箱（例如 `1361942776@qq.com`），只有这些邮箱能批准图片修改。
+5. `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD`：Cloudflare Access 的团队域名与 Application Audience，用于校验登录 JWT 签名。AUD 可在 Zero Trust → Access → Applications 对应应用里找到（登录跳转 URL 的 `kid` 参数也是它）。`REQUIRE_AUTH = "true"` 时这两个值必须与 Access 应用一致，否则所有人都会被判为未登录。
 
 R2 桶需先在 Cloudflare 控制台绑定 `img.ncepuinfo.cc` 之类的自定义域名，上传 URL 才能公开访问。
 
@@ -97,4 +98,4 @@ pnpm deploy:worker
 2. 身份源选择 GitHub，并限制只有 NCEPUwiki 组织/团队成员可访问。
 3. 将 `wrangler.toml` 中 `REQUIRE_AUTH` 改为 `"true"` 后重新部署。
 
-启用后，Worker 会要求请求携带 Cloudflare Access 签发的 JWT；未登录请求会被拒绝。
+启用后，Worker 会要求请求携带 Cloudflare Access 签发的 JWT，并用 `ACCESS_TEAM_DOMAIN` 的公钥校验 RS256 签名、`iss`、`aud` 与有效期；只伪造 `CF-Access-Jwt-Assertion` 头无法再冒充 owner，未登录请求会被拒绝。校验失败原因会以 `[access] JWT 校验失败：…` 打到 Worker 日志里，可用 `pnpm exec wrangler tail` 排查。
