@@ -6,6 +6,9 @@ compatibility_date = "2026-09-08"
 IMAGE_BASE_URL = "https://img.ncepuinfo.cc"
 REQUIRE_AUTH = "true"
 ADMIN_EMAILS = "1361942776@qq.com,2668566027@qq.com"
+# Cloudflare Access 登录团队域名与 Application Audience（用于校验 JWT 签名）
+ACCESS_TEAM_DOMAIN = "https://ncepuwiki.cloudflareaccess.com"
+ACCESS_AUD = "611b1c0247488b8e43511c4067980306c89afd3a8305769957e37f2fcbb9daaa"
 
 [[r2_buckets]]
 binding = "IMAGES"
