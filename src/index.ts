@@ -25,6 +25,22 @@ const MIME_BY_EXT: Record<string, string> = {
 	avif: 'image/avif',
 }
 
+/**
+ * 公开图片的缓存策略：关闭边缘缓存，浏览器每次校验。
+ *
+ * img.ncepuinfo.cc 是 R2 自定义域名：对象不写 Cache-Control 时 Cloudflare 按默认
+ * 4 小时（max-age=14400）缓存，删除后重新上传同名文件时 URL 不变，浏览器和边缘
+ * 节点就会继续返回旧图。
+ *
+ * 实测该域名下 Cloudflare 会把公开响应的 max-age 统一改写成 14400
+ * （no-cache、max-age=0、public, max-age=60 都无效），只有 private / no-store
+ * 能原样返回并让边缘 cf-cache-status 变成 BYPASS。
+ *
+ * 所以这里用 private, max-age=0, must-revalidate：边缘不缓存，浏览器每次带
+ * ETag 校验（内容没变返回 304，省流量），换图后 ETag 变化立即拿到新内容。
+ */
+const PUBLIC_CACHE_CONTROL = 'private, max-age=0, must-revalidate'
+
 interface Identity {
 	email?: string
 	name?: string
@@ -209,7 +225,10 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 		return '源图片不存在'
 	const extension = newKey.split('.').pop()?.toLowerCase() || ''
 	await env.IMAGES.put(newKey, source.body, {
-		httpMetadata: { contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream' },
+		httpMetadata: {
+			contentType: MIME_BY_EXT[extension] || source.httpMetadata?.contentType || 'application/octet-stream',
+			cacheControl: PUBLIC_CACHE_CONTROL,
+		},
 		// 移动/重命名/整目录移动时保留原文件名元数据
 		customMetadata: source.customMetadata,
 	})
@@ -249,7 +268,10 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 			return { error: '待上传的图片数据已丢失', status: 404 }
 		const extension = record.upload.finalKey.split('.').pop()?.toLowerCase() || ''
 		await env.IMAGES.put(record.upload.finalKey, staged.body, {
-			httpMetadata: { contentType: MIME_BY_EXT[extension] || 'application/octet-stream' },
+			httpMetadata: {
+				contentType: MIME_BY_EXT[extension] || 'application/octet-stream',
+				cacheControl: PUBLIC_CACHE_CONTROL,
+			},
 			// 保存原始上传文件名与内容哈希；列表展示原名，同名同内容仍可去重
 			customMetadata: {
 				originalName: record.upload.originalName,
