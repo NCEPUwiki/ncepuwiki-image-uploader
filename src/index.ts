@@ -16,8 +16,15 @@ const ALLOWED_TYPES: Record<string, string> = {
 }
 
 const MAX_SIZE = 10 * 1024 * 1024
-const FOLDER_RE = /^(?:\d{1,3}(?:\/\d{1,3})*)?$/
-const IMAGE_KEY_RE = /^(?:\d{1,3}\/)*\d{1,3}\/[^/]+\.(?:jpg|jpeg|png|webp|gif|avif)$/i
+/**
+ * 目录名规则：不再限定纯数字编号，数字/字母/中文等可读字符都允许，
+ * 只排除路径分隔符与控制字符（即不能用于 R2 key / URL 的字符）。
+ * 每段以 _ 开头的名字（_pending 等）留给内部使用，普通目录必须由其他字符开头。
+ */
+const FOLDER_SEGMENT_SRC = '(?!_)(?!\\.+$)[\\w\\u4e00-\\u9fff .\\-()[\\]（）【】]*[\\w\\u4e00-\\u9fff \\-()[\\]（）【】]'
+const FOLDER_SEGMENT_RE = new RegExp(`^${FOLDER_SEGMENT_SRC}$`)
+const FOLDER_RE = new RegExp(`^$|^${FOLDER_SEGMENT_SRC}(?:/${FOLDER_SEGMENT_SRC})*$`)
+const IMAGE_KEY_RE = /^(?:[^/]+\/)*[^/]+\.(?:jpg|jpeg|png|webp|gif|avif)$/i
 const MIME_BY_EXT: Record<string, string> = {
 	jpg: 'image/jpeg',
 	jpeg: 'image/jpeg',
@@ -592,7 +599,7 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 	const url = new URL(request.url)
 	const folder = url.searchParams.get('folder') || ''
 	if (!FOLDER_RE.test(folder))
-		return json({ error: '目录格式应为数字编号路径，例如 05/09' }, 400)
+		return json({ error: '目录名不能包含 / \\ : * ? " < > | 等字符，例如 05/09 或 素材/校园' }, 400)
 
 	const cursor = url.searchParams.get('cursor') || undefined
 	const prefix = folder ? `${folder}/` : ''
@@ -608,7 +615,7 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 		folder,
 		folders: (page.delimitedPrefixes || [])
 			.map(prefixPath => prefixPath.replace(/\/+$/, ''))
-			.filter(folderName => /^\d/.test(folderName)),
+			.filter(folderName => FOLDER_SEGMENT_RE.test(folderName.replace(/^.*\//, ''))),
 		files: page.objects
 			.filter(object => IMAGE_KEY_RE.test(object.key))
 			.map(object => ({
@@ -758,14 +765,14 @@ async function upload(request: Request, env: Env): Promise<Response> {
 	let folder = ''
 	if (folderParam) {
 		if (!FOLDER_RE.test(folderParam))
-			return json({ error: '目录格式应为数字编号路径，例如 05/09' }, 400)
+			return json({ error: '目录名不能包含 / \\ : * ? " < > | 等字符，例如 05/09 或 素材/校园' }, 400)
 		folder = folderParam
 	}
 	else {
 		const articlePath = String(form.get('article') || '').trim()
 		const derived = articleFolder(articlePath)
 		if (!derived)
-			return json({ error: '缺少上传目录：请指定数字目录（如 05/09）或文章路径' }, 400)
+			return json({ error: '缺少上传目录：请指定目录（如 05/09、素材/校园）或文章路径' }, 400)
 		folder = derived
 	}
 
@@ -1025,6 +1032,11 @@ async function page(request: Request, env: Env): Promise<Response> {
 	<p id="identity">当前身份：${email}</p>
 	${managementCard}${approvalCard}${dialogMarkup}
 	<script type="module">
+		// 目录名可读即可：数字编号、中文、字母、空格与常见符号都允许，
+		// 仅排除路径分隔符、控制字符，以及留给内部使用的 _ 开头名字。
+		const FOLDER_NAME_RE = /^(?!_)(?!\\.+$)[\\w\\u4e00-\\u9fff .\\-()[\\]（）【】]*[\\w\\u4e00-\\u9fff \\-()[\\]（）【】]$/
+		const FOLDER_NAME_HINT = '目录名可用数字、字母、中文、空格以及 . - _ ( ) （ ） 【 】，不能包含 / \\ : * ? " < > | 等字符'
+
 		const fileInput = document.querySelector('#fileInput')
 		const folderInput = document.querySelector('#folderInput')
 		const driveCard = document.querySelector('#driveCard')
@@ -1579,18 +1591,21 @@ async function page(request: Request, env: Env): Promise<Response> {
 			const hint = document.createElement('p')
 			hint.textContent = context + '新建文件夹。R2 不支持真空目录，申请批准后会写入一个隐藏占位文件让空文件夹显示在列表中。'
 			const label = document.createElement('label')
-			label.textContent = '新文件夹编号（1-3 位数字）：'
+			label.textContent = '新文件夹名称：'
 			const input = document.createElement('input')
 			input.type = 'text'
-			input.inputMode = 'numeric'
-			input.maxLength = 3
+			input.maxLength = 80
+			input.placeholder = '例如 99、素材、校园生活'
 			input.style.width = '100%'
 			label.append(document.createElement('br'), input)
-			body.append(hint, label)
+			const nameHint = document.createElement('p')
+			nameHint.className = 'drive-hint'
+			nameHint.textContent = FOLDER_NAME_HINT
+			body.append(hint, label, nameHint)
 			openDialog('新建文件夹', body, '提交新建申请', async () => {
 				const name = input.value.trim()
-				if (!/^\\d{1,3}$/.test(name)) {
-					alert('文件夹编号只能是 1-3 位数字，例如 99')
+				if (!FOLDER_NAME_RE.test(name)) {
+					alert('文件夹名称无效：' + FOLDER_NAME_HINT)
 					return
 				}
 				const folder = driveFolder ? driveFolder + '/' + name : name
@@ -1622,26 +1637,28 @@ async function page(request: Request, env: Env): Promise<Response> {
 			const current = folder.split('/').pop() || folder
 			const body = document.createElement('div')
 			const hint = document.createElement('p')
-			hint.textContent = '重命名文件夹「' + folder + '」，只修改最后一级编号。'
+			hint.textContent = '重命名文件夹「' + folder + '」，只修改最后一级名称。'
 			const label = document.createElement('label')
-			label.textContent = '新编号（1-3 位数字）：'
+			label.textContent = '新名称：'
 			const input = document.createElement('input')
 			input.type = 'text'
-			input.inputMode = 'numeric'
-			input.maxLength = 3
+			input.maxLength = 80
 			input.value = current
 			input.style.width = '100%'
 			label.append(document.createElement('br'), input)
-			body.append(hint, label)
+			const nameHint = document.createElement('p')
+			nameHint.className = 'drive-hint'
+			nameHint.textContent = FOLDER_NAME_HINT
+			body.append(hint, label, nameHint)
 			openDialog('重命名文件夹', body, '提交重命名申请', async () => {
 				const name = input.value.trim()
-				if (!/^\\d{1,3}$/.test(name)) {
-					alert('文件夹编号只能是 1-3 位数字')
+				if (!FOLDER_NAME_RE.test(name)) {
+					alert('文件夹名称无效：' + FOLDER_NAME_HINT)
 					return
 				}
 				const newFolder = parent ? parent + '/' + name : name
 				if (newFolder === folder) {
-					alert('新旧编号相同')
+					alert('新旧名称相同')
 					return
 				}
 				driveDialogOk.disabled = true
