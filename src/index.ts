@@ -342,12 +342,13 @@ async function requireIdentity(request: Request, env: Env): Promise<(Identity & 
 
 interface PendingRecord {
 	id: string
-	type: 'upload' | 'delete' | 'move' | 'folder-create' | 'folder-rename' | 'folder-delete' | 'folder-move'
+	type: 'upload' | 'delete' | 'move' | 'move-batch' | 'folder-create' | 'folder-rename' | 'folder-delete' | 'folder-move'
 	actorEmail: string
 	createdAt: string
 	upload?: { stagedKey: string; finalKey: string; originalName: string; size: number; sha256?: string }
 	delete?: { key: string }
 	move?: { oldKey: string; newKey: string }
+	moves?: { oldKey: string; newKey: string }[]
 	folderCreate?: { folder: string }
 	folderRename?: { folder: string; newFolder: string }
 	folderDelete?: { folder: string }
@@ -355,6 +356,8 @@ interface PendingRecord {
 }
 
 const PENDING_PREFIX = '_pending/'
+/** 一次批量移动的图片数量上限，避免单次请求里 R2 操作过多。 */
+const MOVE_BATCH_LIMIT = 100
 const validKey = (key: string | undefined): key is string => Boolean(key && IMAGE_KEY_RE.test(key))
 
 function newRequestId(): string {
@@ -395,6 +398,43 @@ async function moveObject(env: Env, oldKey: string, newKey: string): Promise<str
 	})
 	await env.IMAGES.delete(oldKey)
 	return null
+}
+
+/** 拼接目录与相对路径；根目录（''）不产生多余的前导斜杠。 */
+function joinKey(folder: string, rest: string): string {
+	return folder ? `${folder}/${rest}` : rest
+}
+
+/**
+ * 读取（列表 / 打开目录）时的宽松校验：允许历史遗留的目录名，
+ * 只挡路径穿越、控制字符与内部保留前缀（_pending 等）。
+ */
+function visibleFolderName(segment: string): boolean {
+	return Boolean(segment)
+		&& segment !== '.'
+		&& segment !== '..'
+		&& !segment.startsWith('_')
+		&& !/[\u0000-\u001f\\]/.test(segment)
+}
+
+function readableFolder(folder: string): boolean {
+	return !folder || folder.split('/').every(visibleFolderName)
+}
+
+/** 取 key 所在的目录。 */
+function folderOf(key: string): string {
+	const index = key.lastIndexOf('/')
+	return index === -1 ? '' : key.slice(0, index)
+}
+
+/**
+ * 移动目标里的目录部分必须是合法目录，避免凭空生成 :07 这类目录；
+ * 已经存在于历史遗留目录里的图片，仍允许在目录内改名。
+ */
+function validMoveTarget(newKey: string, oldKey?: string): boolean {
+	if (FOLDER_RE.test(folderOf(newKey)))
+		return true
+	return Boolean(oldKey) && folderOf(newKey) === folderOf(oldKey as string)
 }
 
 /**
@@ -447,11 +487,49 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 	else if (record.type === 'move' && record.move) {
 		if (!validKey(record.move.oldKey) || !validKey(record.move.newKey))
 			return { error: '申请中的图片路径无效', status: 400 }
+		if (!validMoveTarget(record.move.newKey, record.move.oldKey))
+			return { error: `目标目录 ${folderOf(record.move.newKey)} 不是合法目录名`, status: 400 }
 		if (record.move.oldKey !== record.move.newKey && await env.IMAGES.head(record.move.newKey))
 			return { error: '目标位置已有同名图片，请先处理冲突', status: 409 }
 		const error = record.move.oldKey === record.move.newKey ? null : await moveObject(env, record.move.oldKey, record.move.newKey)
 		if (error)
 			return { error, status: 404 }
+	}
+	else if (record.type === 'move-batch' && record.moves) {
+		const pending = record.moves.filter(move => move.oldKey !== move.newKey)
+		if (!pending.length)
+			return { error: '申请里没有需要移动的图片', status: 400 }
+		if (pending.length > MOVE_BATCH_LIMIT)
+			return { error: `一次最多移动 ${MOVE_BATCH_LIMIT} 张图片，请分批提交`, status: 400 }
+		const sources = new Set(pending.map(move => move.oldKey))
+		for (const move of pending) {
+			if (!validKey(move.oldKey) || !validKey(move.newKey))
+				return { error: '申请中的图片路径无效', status: 400 }
+			if (!validMoveTarget(move.newKey, move.oldKey))
+				return { error: `目标目录 ${folderOf(move.newKey)} 不是合法目录名`, status: 400 }
+		}
+		// 先整体校验冲突，再统一执行：要么全部移动成功，要么一张都不动
+		const conflicts: string[] = []
+		for (const move of pending) {
+			if (sources.has(move.newKey) || await env.IMAGES.head(move.newKey))
+				conflicts.push(move.newKey)
+		}
+		if (conflicts.length) {
+			const shown = conflicts.slice(0, 3).join('、')
+			const suffix = conflicts.length > 3 ? ` 等 ${conflicts.length} 张` : ''
+			return { error: `目标目录已有同名图片：${shown}${suffix}，请先处理冲突后再移动`, status: 409 }
+		}
+		const moved: { oldKey: string; newKey: string }[] = []
+		for (const move of pending) {
+			const error = await moveObject(env, move.oldKey, move.newKey)
+			if (error) {
+				// 回滚已移动的部分，避免留下“移动了一半”的状态
+				for (const applied of moved.reverse())
+					await moveObject(env, applied.newKey, applied.oldKey)
+				return { error: `${error}（本次移动已回滚，图片位置未改变）`, status: 404 }
+			}
+			moved.push(move)
+		}
 	}
 	else if (record.type === 'folder-delete' && record.folderDelete) {
 		const keys = await listAllKeys(env, `${record.folderDelete.folder}/`)
@@ -469,7 +547,7 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 		const destKeys = new Set(await listAllKeys(env, `${dest}/`))
 		const markerName = '.folder'
 		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const newKey = joinKey(dest, key.slice(source.length + 1))
 			// 隐藏占位文件可重复存在于不同目录，不作为冲突；真正的图片冲突才阻止移动
 			if (key.endsWith(`/${markerName}`))
 				continue
@@ -477,7 +555,7 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 				return { error: `目标目录已有 ${newKey}，请先处理冲突`, status: 409 }
 		}
 		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const newKey = joinKey(dest, key.slice(source.length + 1))
 			if (key.endsWith(`/${markerName}`)) {
 				// 目标若已有占位文件则不再重复创建，移动完成后删除旧的即可
 				if (destKeys.has(newKey))
@@ -508,7 +586,7 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 	else if (record.type === 'folder-rename' && record.folderRename) {
 		const source = record.folderRename.folder
 		const dest = record.folderRename.newFolder
-		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source)
+		if (!FOLDER_RE.test(source) || !FOLDER_RE.test(dest) || !source || !dest)
 			return { error: '文件夹路径无效', status: 400 }
 		if (dest === source || dest.startsWith(source + '/'))
 			return { error: '新路径无效', status: 409 }
@@ -519,7 +597,7 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 		if (destKeys.length)
 			return { error: `目标目录 ${dest} 已存在`, status: 409 }
 		for (const key of sourceKeys) {
-			const newKey = `${dest}/${key.slice(source.length + 1)}`
+			const newKey = joinKey(dest, key.slice(source.length + 1))
 			const error = await moveObject(env, key, newKey)
 			if (error)
 				return { error, status: 404 }
@@ -598,10 +676,10 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 
 	const url = new URL(request.url)
 	const folder = url.searchParams.get('folder') || ''
-	if (!FOLDER_RE.test(folder))
-		return json({ error: '目录名不能包含 / \\ : * ? " < > | 等字符，例如 05/09 或 素材/校园' }, 400)
-
 	const cursor = url.searchParams.get('cursor') || undefined
+	// 读取目录放宽校验：历史遗留的目录名（例如误操作生成的 :07）也要能打开、整理
+	if (!readableFolder(folder))
+		return json({ error: '目录路径无效' }, 400)
 	const prefix = folder ? `${folder}/` : ''
 	const page = await env.IMAGES.list({
 		prefix,
@@ -615,7 +693,8 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 		folder,
 		folders: (page.delimitedPrefixes || [])
 			.map(prefixPath => prefixPath.replace(/\/+$/, ''))
-			.filter(folderName => FOLDER_SEGMENT_RE.test(folderName.replace(/^.*\//, ''))),
+			// 只隐藏内部保留目录，其余（含历史遗留的异常名）都展示，便于整理
+			.filter(folderPath => visibleFolderName(folderPath.replace(/^.*\//, ''))),
 		files: page.objects
 			.filter(object => IMAGE_KEY_RE.test(object.key))
 			.map(object => ({
@@ -638,7 +717,16 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	if (!identity)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
-	let body: { action?: string; key?: string; oldKey?: string; newKey?: string; folder?: string; newFolder?: string; destFolder?: string }
+	let body: {
+		action?: string
+		key?: string
+		oldKey?: string
+		newKey?: string
+		folder?: string
+		newFolder?: string
+		destFolder?: string
+		moves?: { oldKey?: string; newKey?: string }[]
+	}
 	try {
 		body = await request.json() as typeof body
 	}
@@ -660,7 +748,34 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 			return json({ error: '无效的图片 key' }, 400)
 		if (body.oldKey === body.newKey)
 			return json({ error: '新旧路径相同' }, 400)
+		if (!validMoveTarget(body.newKey, body.oldKey))
+			return json({ error: `目标目录 ${folderOf(body.newKey)} 不是合法目录名` }, 400)
 		record = { id, type: 'move', actorEmail: identity.email, createdAt, move: { oldKey: body.oldKey, newKey: body.newKey } }
+	}
+	else if (body.action === 'move-batch') {
+		const list = Array.isArray(body.moves) ? body.moves : []
+		if (!list.length)
+			return json({ error: '没有需要移动的图片' }, 400)
+		if (list.length > MOVE_BATCH_LIMIT)
+			return json({ error: `一次最多移动 ${MOVE_BATCH_LIMIT} 张图片，请分批提交` }, 400)
+		const moves: { oldKey: string; newKey: string }[] = []
+		const seen = new Set<string>()
+		for (const move of list) {
+			if (!move || !validKey(move.oldKey) || !validKey(move.newKey))
+				return json({ error: '无效的图片 key' }, 400)
+			// 同一张图片在一次申请里只处理一次
+			if (seen.has(move.newKey))
+				return json({ error: `申请里出现重复目标：${move.newKey}` }, 400)
+			seen.add(move.newKey)
+			if (move.oldKey === move.newKey)
+				continue
+			if (!validMoveTarget(move.newKey, move.oldKey))
+				return json({ error: `目标目录 ${folderOf(move.newKey)} 不是合法目录名` }, 400)
+			moves.push({ oldKey: move.oldKey, newKey: move.newKey })
+		}
+		if (!moves.length)
+			return json({ error: '图片已经在目标目录中' }, 400)
+		record = { id, type: 'move-batch', actorEmail: identity.email, createdAt, moves }
 	}
 	else if (body.action === 'folder-delete') {
 		if (!body.folder || !FOLDER_RE.test(body.folder))
@@ -668,7 +783,8 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		record = { id, type: 'folder-delete', actorEmail: identity.email, createdAt, folderDelete: { folder: body.folder } }
 	}
 	else if (body.action === 'folder-move') {
-		if (!body.folder || !body.destFolder || !FOLDER_RE.test(body.folder) || !FOLDER_RE.test(body.destFolder))
+		// destFolder 允许为空字符串，表示移动到根目录
+		if (!body.folder || typeof body.destFolder !== 'string' || !FOLDER_RE.test(body.folder) || !FOLDER_RE.test(body.destFolder))
 			return json({ error: '文件夹路径无效' }, 400)
 		if (body.folder === body.destFolder)
 			return json({ error: '新旧路径相同' }, 400)
@@ -703,16 +819,19 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		await env.IMAGES.delete(`${PENDING_PREFIX}${id}.json`)
 		const baseUrl = (env.IMAGE_BASE_URL || '').replace(/\/+$/, '')
 		const key = record.upload?.finalKey || ''
+		const count = record.moves ? record.moves.length : record.move ? 1 : 0
 		return json({
 			ok: true,
 			status: 'approved',
 			autoApproved: true,
 			requestId: id,
+			count,
 			key,
 			url: key && baseUrl ? `${baseUrl}/${key}` : '',
 		})
 	}
-	return json({ ok: true, status: 'pending', requestId: id })
+	const count = record.moves ? record.moves.length : record.move ? 1 : 0
+	return json({ ok: true, status: 'pending', requestId: id, count })
 }
 
 /**
@@ -1895,10 +2014,28 @@ async function page(request: Request, env: Env): Promise<Response> {
 			driveContext.hidden = false
 		}
 
+		// 弹窗内部的错误提示：比 alert 更醒目，也不会因为浏览器屏蔽弹窗而“点了没反应”
+		let dialogErrorNote = null
+
+		function dialogError(text) {
+			if (!dialogErrorNote || !driveDialogBody.contains(dialogErrorNote)) {
+				dialogErrorNote = document.createElement('p')
+				dialogErrorNote.className = 'msg error'
+				driveDialogBody.append(dialogErrorNote)
+			}
+			dialogErrorNote.textContent = text
+		}
+
+		function clearDialogError() {
+			if (dialogErrorNote)
+				dialogErrorNote.textContent = ''
+		}
+
 		function openDialog(title, body, okText, onOk) {
 			driveDialogTitle.textContent = title
 			driveDialogBody.textContent = ''
 			driveDialogBody.append(body)
+			dialogErrorNote = null
 			driveDialogOk.textContent = okText
 			driveDialog.dataset.handler = ''
 			driveDialog._onOk = onOk
@@ -1999,7 +2136,9 @@ async function page(request: Request, env: Env): Promise<Response> {
 			body.append(input)
 			openDialog('重命名 ' + displayName, body, '提交重命名申请', async () => {
 				const newName = input.value.trim()
-				const parent = file.key.slice(0, file.key.lastIndexOf('/'))
+				// 根目录下的图片没有 /，不能直接 slice（会截掉最后一个字符），否则会凭空生成 a.jp 这样的目录
+				const slash = file.key.lastIndexOf('/')
+				const parent = slash >= 0 ? file.key.slice(0, slash) : ''
 				if (!newName || newName === displayName) {
 					alert('请输入新文件名')
 					return
@@ -2009,7 +2148,7 @@ async function page(request: Request, env: Env): Promise<Response> {
 					return
 				}
 				try {
-					const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent + '/' + newName })
+					const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey: parent ? parent + '/' + newName : newName })
 					if (result.autoApproved) {
 						driveNoticeMessage('已重命名：' + displayName + ' → ' + newName, false)
 						loadDrive(true)
@@ -2026,7 +2165,8 @@ async function page(request: Request, env: Env): Promise<Response> {
 			})
 		}
 
-		let moveDestination = ''
+		// null = 还没选目标目录；'' = 根目录
+		let moveDestination = null
 		let moveLevels = []
 
 		function clearMoveLevelsFrom(from) {
@@ -2034,6 +2174,10 @@ async function page(request: Request, env: Env): Promise<Response> {
 				const level = moveLevels.pop()
 				level.element.remove()
 			}
+		}
+
+		function moveDestLabel(folder) {
+			return folder ? '「' + folder + '」' : '「根目录」'
 		}
 
 		async function renderMoveLevel(prefix) {
@@ -2045,8 +2189,8 @@ async function page(request: Request, env: Env): Promise<Response> {
 			const select = document.createElement('select')
 			select.className = 'level-select'
 			addOption(select, '请选择…', '')
-			if (prefix)
-				addOption(select, '✅ 移动到此目录', 'dest:' + prefix)
+			// 根目录也要能作为目标，值统一用 'dest:' 前缀（注意 dest: 是 5 个字符）
+			addOption(select, prefix ? '✅ 移动到此目录' : '✅ 移动到根目录', 'dest:' + prefix)
 			const index = moveLevels.length
 			moveLevels.push({ element, prefix })
 			element.append(label, select)
@@ -2066,19 +2210,21 @@ async function page(request: Request, env: Env): Promise<Response> {
 				element.append(failed)
 			}
 			select.addEventListener('change', async () => {
-				if (!select.value)
-					return
-				const value = select.value.slice(4)
 				clearMoveLevelsFrom(index + 1)
-				if (select.value.startsWith('dest:')) {
-					moveDestination = value
-					moveDestNote.textContent = '将移动到：' + value
+				clearDialogError()
+				if (!select.value) {
+					moveDestination = null
+					moveDestNote.textContent = '尚未选择目标目录'
+					return
 				}
-				else {
-					moveDestination = value
-					moveDestNote.textContent = '将移动到：' + value + '（可继续选择更深目录）'
-					await renderMoveLevel(value)
-				}
+				const isDest = select.value.startsWith('dest:')
+				const folder = select.value.slice(isDest ? 5 : 4)
+				moveDestination = folder
+				moveDestNote.textContent = isDest
+					? '将移动到：' + moveDestLabel(folder)
+					: '将移动到：' + moveDestLabel(folder) + '（可继续选择更深目录）'
+				if (!isDest)
+					await renderMoveLevel(folder)
 			})
 		}
 
@@ -2090,7 +2236,7 @@ async function page(request: Request, env: Env): Promise<Response> {
 		function openMoveDialog(files) {
 			moveTargetFiles = files
 			moveSourceFolder = ''
-			moveDestination = ''
+			moveDestination = null
 			moveLevels = []
 			const body = document.createElement('div')
 			const hint = document.createElement('p')
@@ -2098,26 +2244,32 @@ async function page(request: Request, env: Env): Promise<Response> {
 			movePickerBody = document.createElement('div')
 			moveDestNote = document.createElement('p')
 			moveDestNote.className = 'drive-hint'
+			moveDestNote.textContent = '尚未选择目标目录'
 			body.append(hint, movePickerBody, moveDestNote)
 			openDialog('申请移动', body, '提交移动申请', async () => {
-				if (!moveDestination) {
-					alert('请先选择存储里的目标目录')
+				if (moveDestination === null) {
+					dialogError('请先选择存储里的目标目录')
+					return
+				}
+				const moves = []
+				for (const file of moveTargetFiles) {
+					const newKey = moveDestination ? moveDestination + '/' + file.name : file.name
+					if (newKey !== file.key)
+						moves.push({ oldKey: file.key, newKey })
+				}
+				if (!moves.length) {
+					dialogError('这些图片已经在目标目录里了，无需移动')
 					return
 				}
 				driveDialogOk.disabled = true
+				const okText = driveDialogOk.textContent
+				driveDialogOk.textContent = '提交中…'
 				try {
-					let count = 0
-					let autoApproved = 0
-					for (const file of moveTargetFiles) {
-						const newKey = moveDestination + '/' + file.name
-						if (newKey !== file.key) {
-							const result = await apiPost('/api/file', { action: 'move', oldKey: file.key, newKey })
-							count++
-							if (result.autoApproved)
-								autoApproved++
-						}
-					}
-					driveNoticeMessage(autoApproved === count ? '已直接移动 ' + count + ' 张图片' : '已提交 ' + count + ' 条移动申请，等待 owner 批准', false)
+					// 一次申请整批处理：服务器会先校验全部目标，避免只移动了一部分
+					const result = await apiPost('/api/file', { action: 'move-batch', moves })
+					driveNoticeMessage(result.autoApproved
+						? '已直接移动 ' + moves.length + ' 张图片到' + moveDestLabel(moveDestination)
+						: '已提交 ' + moves.length + ' 张图片的移动申请，等待 owner 批准', false)
 					closeDialog()
 					driveSelected.clear()
 					updateDriveSelectionUI()
@@ -2125,19 +2277,23 @@ async function page(request: Request, env: Env): Promise<Response> {
 					loadRequests()
 				}
 				catch (error) {
-					alert(error.message)
+					// 失败时也刷新列表，让页面反映真实状态
+					dialogError(error.message || '移动失败')
+					loadDrive(true)
+					loadRequests()
 				}
 				finally {
 					driveDialogOk.disabled = false
+					driveDialogOk.textContent = okText
 				}
 			})
-			renderMoveLevel([])
+			renderMoveLevel('')
 		}
 
 		function openMoveFolderDialog(folder) {
 			moveSourceFolder = folder
 			moveTargetFiles = []
-			moveDestination = ''
+			moveDestination = null
 			moveLevels = []
 			const body = document.createElement('div')
 			const hint = document.createElement('p')
@@ -2145,32 +2301,43 @@ async function page(request: Request, env: Env): Promise<Response> {
 			movePickerBody = document.createElement('div')
 			moveDestNote = document.createElement('p')
 			moveDestNote.className = 'drive-hint'
+			moveDestNote.textContent = '尚未选择目标目录'
 			body.append(hint, movePickerBody, moveDestNote)
 			openDialog('申请移动文件夹', body, '提交移动申请', async () => {
-				if (!moveDestination) {
-					alert('请先选择存储里的目标目录')
+				if (moveDestination === null) {
+					dialogError('请先选择存储里的目标目录')
 					return
 				}
-				if (moveDestination === moveSourceFolder || moveDestination.startsWith(moveSourceFolder + '/')) {
-					alert('不能移动到自身或其子目录')
+				if (moveDestination === moveSourceFolder || (moveDestination && moveDestination.startsWith(moveSourceFolder + '/'))) {
+					dialogError('不能移动到自身或其子目录')
+					return
+				}
+				const sourceParent = moveSourceFolder.includes('/') ? moveSourceFolder.slice(0, moveSourceFolder.lastIndexOf('/')) : ''
+				if (moveDestination === sourceParent) {
+					dialogError('文件夹已经在' + moveDestLabel(sourceParent) + '里了，无需移动')
 					return
 				}
 				driveDialogOk.disabled = true
+				const okText = driveDialogOk.textContent
+				driveDialogOk.textContent = '提交中…'
 				try {
 					const result = await apiPost('/api/file', { action: 'folder-move', folder: moveSourceFolder, destFolder: moveDestination })
-					driveNoticeMessage(result.autoApproved ? '已移动文件夹到 ' + moveDestination : '已提交移动文件夹申请：' + result.requestId, false)
+					driveNoticeMessage(result.autoApproved ? '已移动文件夹到' + moveDestLabel(moveDestination) : '已提交移动文件夹申请：' + result.requestId, false)
 					closeDialog()
 					loadDrive(true)
 					loadRequests()
 				}
 				catch (error) {
-					alert(error.message)
+					dialogError(error.message || '移动失败')
+					loadDrive(true)
+					loadRequests()
 				}
 				finally {
 					driveDialogOk.disabled = false
+					driveDialogOk.textContent = okText
 				}
 			})
-			renderMoveLevel([])
+			renderMoveLevel('')
 		}
 
 		function requestDescription(request) {
@@ -2180,6 +2347,10 @@ async function page(request: Request, env: Env): Promise<Response> {
 				return '删除：' + request.delete.key
 			if (request.type === 'move' && request.move)
 				return '移动：' + request.move.oldKey + ' → ' + request.move.newKey
+			if (request.type === 'move-batch' && request.moves) {
+				const preview = request.moves.slice(0, 2).map(move => move.oldKey + ' → ' + move.newKey).join('；')
+				return '移动 ' + request.moves.length + ' 张图片：' + preview + (request.moves.length > 2 ? ' 等' : '')
+			}
 			if (request.type === 'folder-create' && request.folderCreate)
 				return '新建文件夹：' + request.folderCreate.folder + '/'
 			if (request.type === 'folder-rename' && request.folderRename)
