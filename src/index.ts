@@ -2,6 +2,11 @@ export interface Env {
 	IMAGES: R2Bucket
 	IMAGE_BASE_URL: string
 	REQUIRE_AUTH?: string
+	/** GitHub 组织名：owner 可批准他人申请，组织成员的操作直接生效。 */
+	GITHUB_ORG?: string
+	/** GitHub API 令牌（密钥，不写进 wrangler.toml）：用于查询组织成员角色。 */
+	GITHUB_TOKEN?: string
+	/** 应急 owner 邮箱名单：仅当 GitHub 角色校验不可用时兜底。 */
 	ADMIN_EMAILS?: string
 	ACCESS_TEAM_DOMAIN?: string
 	ACCESS_AUD?: string
@@ -53,6 +58,7 @@ const PUBLIC_CACHE_CONTROL = 'private, max-age=0, must-revalidate'
 interface Identity {
 	email?: string
 	name?: string
+	sub?: string
 }
 
 export default {
@@ -62,8 +68,26 @@ export default {
 		if (request.method === 'GET' && url.pathname === '/')
 			return page(request, env)
 
-		if (request.method === 'GET' && url.pathname === '/api/me')
-			return json({ identity: await identityOf(request, env), requireAuth: isAuthRequired(env) })
+		if (request.method === 'GET' && url.pathname === '/api/me') {
+			const identity = await identityOf(request, env)
+			if (!identity.email)
+				return json({ identity, requireAuth: isAuthRequired(env), role: 'unknown', login: '', canApprove: false, autoApply: false, emergencyOwner: false })
+			const { role, login } = await orgRoleFor(request, env, identity)
+			const body: Record<string, unknown> = { identity, requireAuth: isAuthRequired(env), login, ...viewerAccess(role, identity.email, env) }
+			// 排查用：/api/me?debug=1 附带 Access get-identity 的原始返回与解析过程，只返回请求者本人的数据
+			if (url.searchParams.get('debug') === '1' && isAuthRequired(env)) {
+				const token = accessToken(request)
+				const payload = token ? await accessIdentityPayload(token, env) : null
+				body.debug = {
+					githubOrg: githubOrg(env),
+					hasGithubToken: Boolean(env.GITHUB_TOKEN),
+					payload,
+					candidates: githubAccountCandidates(payload, identity.email),
+					accessOrgs: accessOrgs(payload),
+				}
+			}
+			return json(body)
+		}
 
 		if (request.method === 'GET' && url.pathname === '/api/articles')
 			return json({ articles: await articleOptions() })
@@ -109,6 +133,7 @@ function accessSettings(env: Env): { teamDomain: string; aud: string } {
 interface AccessClaims {
 	email?: string
 	name?: string
+	sub?: string
 	aud?: string | string[]
 	iss?: string
 	exp?: number
@@ -198,6 +223,7 @@ async function verifyAccessToken(token: string, env: Env): Promise<Identity | nu
 	return {
 		email: typeof claims.email === 'string' ? claims.email : undefined,
 		name: typeof claims.name === 'string' ? claims.name : claims.email,
+		sub: typeof claims.sub === 'string' ? claims.sub : undefined,
 	}
 }
 
@@ -256,7 +282,7 @@ async function identityOf(request: Request, env: Env): Promise<Identity> {
 		return (await verifyAccessToken(token, env)) || {}
 	try {
 		const claims = JSON.parse(base64UrlToText(token.split('.')[1] || '')) as AccessClaims
-		return { email: claims.email, name: claims.name || claims.email }
+		return { email: claims.email, name: claims.name || claims.email, sub: claims.sub }
 	}
 	catch {
 		return {}
@@ -321,6 +347,7 @@ async function articleOptions(): Promise<string[]> {
 	}
 }
 
+/** 应急 owner 名单（ADMIN_EMAILS）：只在 GitHub 角色校验不可用时兜底。 */
 function adminEmails(env: Env): string[] {
 	return (env.ADMIN_EMAILS || '')
 		.split(',')
@@ -328,7 +355,7 @@ function adminEmails(env: Env): string[] {
 		.filter(Boolean)
 }
 
-function isAdminIdentity(email: string | undefined, env: Env): boolean {
+function isFallbackAdminEmail(email: string | undefined, env: Env): boolean {
 	if (!email)
 		return false
 	const admins = adminEmails(env)
@@ -337,7 +364,324 @@ function isAdminIdentity(email: string | undefined, env: Env): boolean {
 
 async function requireIdentity(request: Request, env: Env): Promise<(Identity & { email: string }) | null> {
 	const identity = await identityOf(request, env)
-	return identity.email ? { email: identity.email, name: identity.name } : null
+	return identity.email ? { email: identity.email, name: identity.name, sub: identity.sub } : null
+}
+
+/**
+ * 组织角色：权限以 GitHub 组织身份为准。
+ * - owner：组织 owner，可批准/拒绝其他人的申请，自己的操作直接生效
+ * - member：组织成员，自己的操作直接生效（不能批准别人的申请）
+ * - outsider：已登录但不属于组织，改动提交后等 owner 批准
+ * - unknown：暂时无法确认（未配置 GITHUB_TOKEN、Access/GitHub 接口异常、非 GitHub 身份）
+ *
+ * 判定链路：已验证的 Access JWT → 用用户自己的 cookie 调 /cdn-cgi/access/get-identity
+ * 拿到 GitHub 账号（顶层 id 字段，实测是数字账号 ID）→ 经 GitHub API 解析出登录名
+ * → 查组织成员关系（admin 即 owner）；Access 返回的 orgs 列表作为成员关系兜底。
+ * 结果按用户缓存 5 分钟，避免每个请求都访问 Access 与 GitHub；
+ * 只有确定的结果（owner/member/outsider）才写入缓存，故障导致的 unknown 不缓存。
+ */
+type OrgRole = 'owner' | 'member' | 'outsider' | 'unknown'
+
+const GITHUB_ORG_DEFAULT = 'NCEPUwiki'
+const GITHUB_API_VERSION = '2022-11-28'
+/** 角色缓存秒数：组织内角色变更最多 5 分钟后生效。 */
+const ORG_ROLE_CACHE_SECONDS = 300
+/** 令牌持有者自检结果的缓存时间（毫秒）。 */
+const TOKEN_OWNER_CHECK_TTL_MS = 60 * 60 * 1000
+
+interface AccessIdentityPayload {
+	/** 实测是 GitHub 的数字账号 ID（与 Cloudflare 侧的 user_uuid / idp.id 都不同）。 */
+	id?: number | string
+	name?: string
+	user_uuid?: string
+	idp?: { id?: string; type?: string }
+	/** Cloudflare 登录时从 GitHub 读取的组织列表，可用于兜底判断成员身份。 */
+	orgs?: { id?: number; name?: string }[]
+	teams?: unknown[]
+}
+
+/** 用用户自己的 CF_Authorization cookie 调 Access 的身份接口，拿到 IdP 侧数据。 */
+async function accessIdentityPayload(token: string, env: Env): Promise<AccessIdentityPayload | null> {
+	const { teamDomain } = accessSettings(env)
+	try {
+		const response = await fetch(`${teamDomain}/cdn-cgi/access/get-identity`, {
+			headers: {
+				Cookie: `CF_Authorization=${token}`,
+				Accept: 'application/json',
+			},
+		})
+		if (!response.ok) {
+			console.warn(`[auth] get-identity 返回 HTTP ${response.status}，无法确认组织身份`)
+			return null
+		}
+		return await response.json() as AccessIdentityPayload
+	}
+	catch (error) {
+		console.warn(`[auth] get-identity 请求失败：${String(error)}`)
+		return null
+	}
+}
+
+/**
+ * 列出可能的 GitHub 账号标识（按可信度排序）：
+ * 1. Access 身份顶层的 id（实测是 GitHub 的数字账号 ID）
+ * 2. noreply 邮箱里的登录名（形如 `12345+login@users.noreply.github.com`）
+ * 多个线索都试一遍，避免单一字段语义变化时把人误判成非成员。
+ * 注意：idp.id 实测是 Cloudflare 侧的 UUID（不是 GitHub 账号），因此不采用。
+ */
+function githubAccountCandidates(identity: AccessIdentityPayload | null, email: string): string[] {
+	const candidates: string[] = []
+	const id = identity?.id
+	if (typeof id === 'number' && Number.isFinite(id))
+		candidates.push(String(id))
+	else if (typeof id === 'string' && id)
+		candidates.push(id)
+	const match = /^(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$/.exec(email)
+	if (match && !candidates.includes(match[1]))
+		candidates.push(match[1])
+	return candidates
+}
+
+/** Access 身份里 Cloudflare 已核实的组织名列表。 */
+function accessOrgs(identity: AccessIdentityPayload | null): string[] {
+	return (identity?.orgs || [])
+		.map(org => (org?.name || '').trim().toLowerCase())
+		.filter(Boolean)
+}
+
+function githubOrg(env: Env): string {
+	return env.GITHUB_ORG || GITHUB_ORG_DEFAULT
+}
+
+/** 调 GitHub REST API；未配置 GITHUB_TOKEN 或网络失败时返回 null。 */
+async function githubApi(env: Env, path: string): Promise<Response | null> {
+	if (!env.GITHUB_TOKEN) {
+		console.warn('[auth] 未配置 GITHUB_TOKEN，无法校验 GitHub 组织身份')
+		return null
+	}
+	try {
+		return await fetch(`https://api.github.com${path}`, {
+			headers: {
+				Accept: 'application/vnd.github+json',
+				Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+				'X-GitHub-Api-Version': GITHUB_API_VERSION,
+				'User-Agent': 'ncepuwiki-image-uploader',
+			},
+		})
+	}
+	catch (error) {
+		console.warn(`[auth] GitHub API 请求失败：${String(error)}`)
+		return null
+	}
+}
+
+/** 数字账号 ID 换成登录名；本身就是登录名的话先确认账号存在再用。 */
+async function githubLoginFor(env: Env, account: string): Promise<string | null> {
+	if (/^\d+$/.test(account)) {
+		const response = await githubApi(env, `/user/${account}`)
+		if (!response || !response.ok) {
+			console.warn(`[auth] GitHub 账号 ${account} 未能解析成登录名（HTTP ${response ? response.status : '网络错误'}）`)
+			return null
+		}
+		const body = await response.json() as { login?: string }
+		if (!body.login) {
+			console.warn(`[auth] GitHub 账号 ${account} 的响应里没有登录名`)
+			return null
+		}
+		return body.login
+	}
+	if (!/^[A-Za-z0-9-]+$/.test(account)) {
+		console.warn(`[auth] 无法识别的 GitHub 账号标识：${account}`)
+		return null
+	}
+	// 非数字候选先确认账号存在，避免把不存在的名字当成"确定不是成员"
+	const check = await githubApi(env, `/users/${encodeURIComponent(account)}`)
+	if (!check)
+		return null
+	if (check.status === 404) {
+		console.log(`[auth] GitHub 账号 ${account} 不存在，跳过该候选`)
+		return null
+	}
+	if (!check.ok) {
+		console.warn(`[auth] 校验 GitHub 账号 ${account} 失败：HTTP ${check.status}`)
+		return null
+	}
+	return account
+}
+
+let tokenOwnerCheck: { ok: boolean; checkedAt: number } | null = null
+
+/**
+ * 自检 GITHUB_TOKEN 的持有者本身是否在组织里。
+ * 若不在，memberships 接口会对所有查询返回 404，把真正的成员误判成非成员；
+ * 所以只有自检通过，404 才被当作"确定不是成员"。
+ */
+async function githubTokenUsable(env: Env): Promise<boolean> {
+	if (tokenOwnerCheck && Date.now() - tokenOwnerCheck.checkedAt < TOKEN_OWNER_CHECK_TTL_MS)
+		return tokenOwnerCheck.ok
+	const me = await githubApi(env, '/user')
+	let ok = false
+	if (me && me.ok) {
+		const body = await me.json() as { login?: string }
+		if (body.login) {
+			const membership = await githubApi(env, `/orgs/${encodeURIComponent(githubOrg(env))}/memberships/${encodeURIComponent(body.login)}`)
+			if (membership && membership.ok) {
+				const detail = await membership.json() as { state?: string }
+				ok = detail.state === 'active'
+			}
+		}
+	}
+	if (!ok)
+		console.warn(`[auth] GITHUB_TOKEN 校验不通过：令牌持有者不是 ${githubOrg(env)} 的成员或令牌无效，成员判定暂时不可用`)
+	tokenOwnerCheck = { ok, checkedAt: Date.now() }
+	return ok
+}
+
+async function githubOrgRole(env: Env, login: string): Promise<OrgRole> {
+	const org = githubOrg(env)
+	const response = await githubApi(env, `/orgs/${encodeURIComponent(org)}/memberships/${encodeURIComponent(login)}`)
+	if (!response)
+		return 'unknown'
+	if (response.status === 404) {
+		if (!(await githubTokenUsable(env)))
+			return 'unknown'
+		console.log(`[auth] ${login} 不是 ${org} 组织成员`)
+		return 'outsider'
+	}
+	if (!response.ok) {
+		console.warn(`[auth] 查询 ${org} 成员角色失败：HTTP ${response.status}`)
+		return 'unknown'
+	}
+	const body = await response.json() as { state?: string; role?: string }
+	if (body.state !== 'active') {
+		console.log(`[auth] ${login} 在 ${org} 的成员状态是 ${body.state || '未知'}，按非成员处理`)
+		return 'outsider'
+	}
+	const role: OrgRole = body.role === 'admin' ? 'owner' : 'member'
+	console.log(`[auth] ${login} 是 ${org} 的${role === 'owner' ? ' owner' : '成员'}`)
+	return role
+}
+
+async function orgRoleFor(request: Request, env: Env, identity: Identity): Promise<{ role: OrgRole; login: string }> {
+	const email = (identity.email || '').toLowerCase()
+	// v2：账号解析逻辑变更，换缓存键让旧结论立刻失效
+	const cacheKey = `https://github-role.invalid/v2/${encodeURIComponent(identity.sub || email)}`
+	try {
+		const hit = await caches.default.match(cacheKey)
+		if (hit) {
+			const cached = await hit.json() as { role?: OrgRole; login?: string }
+			if (cached.role && cached.role !== 'unknown')
+				return { role: cached.role, login: cached.login || '' }
+		}
+	}
+	catch {
+		// 缓存不可用时继续走实时查询
+	}
+
+	let candidates: string[] = []
+	let inOrgFromAccess = false
+	if (isAuthRequired(env)) {
+		const token = accessToken(request)
+		const payload = token ? await accessIdentityPayload(token, env) : null
+		candidates = githubAccountCandidates(payload, email)
+		inOrgFromAccess = accessOrgs(payload).includes(githubOrg(env).toLowerCase())
+		// 排查用：日志里能看到 Access 实际返回的身份字段与判定依据
+		console.log(`[auth] idp=${JSON.stringify(payload?.idp || null)} 账号候选=${candidates.join('、') || '无'} 组织成员=${inOrgFromAccess}`)
+	}
+	else {
+		// 本地开发没有 Access，只能从 noreply 邮箱推断
+		candidates = githubAccountCandidates(null, email)
+	}
+
+	const result: { role: OrgRole; login: string } = { role: 'unknown', login: '' }
+	for (const candidate of candidates) {
+		const login = await githubLoginFor(env, candidate)
+		if (!login)
+			continue
+		const role = await githubOrgRole(env, login)
+		// owner/member 是确定结论，直接采用；outsider 先记下，再试下一个候选
+		if (role === 'owner' || role === 'member') {
+			result.role = role
+			result.login = login
+			break
+		}
+		if (role === 'outsider' && result.role === 'unknown') {
+			result.role = 'outsider'
+			result.login = login
+		}
+	}
+
+	// GitHub 接口给不出确定结论时，用 Access 身份里 Cloudflare 已核实的组织成员关系兜底
+	if (result.role === 'outsider' && inOrgFromAccess) {
+		// 两边互相矛盾：宁可判"未确认"，也不要因为接口口径问题把成员关在外面或放错人进来
+		console.warn(`[auth] 角色冲突：GitHub 接口显示 ${result.login || '该账号'} 不在 ${githubOrg(env)}，但 Access 身份显示在组织里，按未确认处理`)
+		result.role = 'unknown'
+	}
+	else if (result.role === 'unknown' && inOrgFromAccess) {
+		console.warn(`[auth] 角色接口暂不可用，按 Access 身份确认的 ${githubOrg(env)} 成员处理`)
+		result.role = 'member'
+	}
+
+	if (result.role !== 'unknown') {
+		try {
+			await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
+				headers: {
+					'Content-Type': 'application/json; charset=utf-8',
+					'Cache-Control': `max-age=${ORG_ROLE_CACHE_SECONDS}`,
+				},
+			}))
+		}
+		catch {
+			// 写缓存失败不影响本次判定
+		}
+	}
+	return result
+}
+
+interface Viewer extends Identity {
+	email: string
+	role: OrgRole
+	login: string
+	canApprove: boolean
+	autoApply: boolean
+	emergencyOwner: boolean
+}
+
+/**
+ * 把角色换算成实际权限。
+ * GitHub 校验临时不可用（unknown）时，ADMIN_EMAILS 作为应急 owner 兜底，
+ * 保证还有账号能批准申请；判定明确（owner/member/outsider）时兜底不生效。
+ */
+function viewerAccess(role: OrgRole, email: string, env: Env): { role: OrgRole; canApprove: boolean; autoApply: boolean; emergencyOwner: boolean } {
+	const emergencyOwner = role === 'unknown' && isFallbackAdminEmail(email, env)
+	if (emergencyOwner)
+		console.warn(`[auth] GitHub 组织角色未确认，${email} 按应急 owner（ADMIN_EMAILS）处理`)
+	return {
+		role,
+		canApprove: role === 'owner' || emergencyOwner,
+		autoApply: role === 'owner' || role === 'member' || emergencyOwner,
+		emergencyOwner,
+	}
+}
+
+async function requireViewer(request: Request, env: Env): Promise<Viewer | null> {
+	const identity = await identityOf(request, env)
+	if (!identity.email)
+		return null
+	const { role, login } = await orgRoleFor(request, env, identity)
+	return { email: identity.email, name: identity.name, sub: identity.sub, login, ...viewerAccess(role, identity.email, env) }
+}
+
+function roleLabel(viewer: { role: OrgRole; emergencyOwner: boolean }): string {
+	if (viewer.role === 'owner')
+		return '· 组织 owner'
+	if (viewer.role === 'member')
+		return '· 组织成员（操作直接生效）'
+	if (viewer.role === 'outsider')
+		return '· 非组织成员（操作需 owner 批准）'
+	return viewer.emergencyOwner
+		? '· 应急 owner（GitHub 角色校验暂不可用）'
+		: '· 组织角色未确认（GitHub 校验暂不可用）'
 }
 
 interface PendingRecord {
@@ -607,11 +951,11 @@ async function executePendingRecord(env: Env, record: PendingRecord): Promise<{ 
 }
 
 async function approveRequest(request: Request, env: Env): Promise<Response> {
-	const identity = await requireIdentity(request, env)
-	if (!identity)
+	const viewer = await requireViewer(request, env)
+	if (!viewer)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
-	if (!isAdminIdentity(identity.email, env))
-		return json({ error: '只有 NCEPUwiki owner 可以批准' }, 403)
+	if (!viewer.canApprove)
+		return json({ error: `只有 ${githubOrg(env)} 组织 owner 可以批准` }, 403)
 
 	let body: { requestId?: string; decision?: string }
 	try {
@@ -644,12 +988,13 @@ async function approveRequest(request: Request, env: Env): Promise<Response> {
 }
 
 async function listRequests(request: Request, env: Env): Promise<Response> {
-	const identity = await requireIdentity(request, env)
-	if (!identity)
+	const viewer = await requireViewer(request, env)
+	if (!viewer)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
 	const mineOnly = new URL(request.url).searchParams.get('mine') === '1'
-	const admin = isAdminIdentity(identity.email, env)
+	// 组织 owner 能看到全部申请，其他人只看自己的
+	const canApprove = viewer.canApprove
 	const page = await env.IMAGES.list({ prefix: PENDING_PREFIX, delimiter: '/' })
 	const requests: PendingRecord[] = []
 	for (const object of page.objects) {
@@ -659,14 +1004,14 @@ async function listRequests(request: Request, env: Env): Promise<Response> {
 		const record = await readPending(env, id)
 		if (!record)
 			continue
-		if (mineOnly && record.actorEmail.toLowerCase() !== identity.email.toLowerCase())
+		if (mineOnly && record.actorEmail.toLowerCase() !== viewer.email.toLowerCase())
 			continue
-		if (!mineOnly && !admin && record.actorEmail.toLowerCase() !== identity.email.toLowerCase())
+		if (!mineOnly && !canApprove && record.actorEmail.toLowerCase() !== viewer.email.toLowerCase())
 			continue
 		requests.push(record)
 	}
 	requests.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-	return json({ requests, admin })
+	return json({ requests, canApprove, autoApply: viewer.autoApply })
 }
 
 async function listFiles(request: Request, env: Env): Promise<Response> {
@@ -713,8 +1058,8 @@ async function listFiles(request: Request, env: Env): Promise<Response> {
 }
 
 async function fileAction(request: Request, env: Env): Promise<Response> {
-	const identity = await requireIdentity(request, env)
-	if (!identity)
+	const viewer = await requireViewer(request, env)
+	if (!viewer)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
 	let body: {
@@ -741,7 +1086,7 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 	if (body.action === 'delete') {
 		if (!validKey(body.key))
 			return json({ error: '无效的图片 key' }, 400)
-		record = { id, type: 'delete', actorEmail: identity.email, createdAt, delete: { key: body.key } }
+		record = { id, type: 'delete', actorEmail: viewer.email, createdAt, delete: { key: body.key } }
 	}
 	else if (body.action === 'move') {
 		if (!validKey(body.oldKey) || !validKey(body.newKey))
@@ -750,7 +1095,7 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 			return json({ error: '新旧路径相同' }, 400)
 		if (!validMoveTarget(body.newKey, body.oldKey))
 			return json({ error: `目标目录 ${folderOf(body.newKey)} 不是合法目录名` }, 400)
-		record = { id, type: 'move', actorEmail: identity.email, createdAt, move: { oldKey: body.oldKey, newKey: body.newKey } }
+		record = { id, type: 'move', actorEmail: viewer.email, createdAt, move: { oldKey: body.oldKey, newKey: body.newKey } }
 	}
 	else if (body.action === 'move-batch') {
 		const list = Array.isArray(body.moves) ? body.moves : []
@@ -775,12 +1120,12 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 		}
 		if (!moves.length)
 			return json({ error: '图片已经在目标目录中' }, 400)
-		record = { id, type: 'move-batch', actorEmail: identity.email, createdAt, moves }
+		record = { id, type: 'move-batch', actorEmail: viewer.email, createdAt, moves }
 	}
 	else if (body.action === 'folder-delete') {
 		if (!body.folder || !FOLDER_RE.test(body.folder))
 			return json({ error: '文件夹路径无效' }, 400)
-		record = { id, type: 'folder-delete', actorEmail: identity.email, createdAt, folderDelete: { folder: body.folder } }
+		record = { id, type: 'folder-delete', actorEmail: viewer.email, createdAt, folderDelete: { folder: body.folder } }
 	}
 	else if (body.action === 'folder-move') {
 		// destFolder 允许为空字符串，表示移动到根目录
@@ -788,27 +1133,27 @@ async function fileAction(request: Request, env: Env): Promise<Response> {
 			return json({ error: '文件夹路径无效' }, 400)
 		if (body.folder === body.destFolder)
 			return json({ error: '新旧路径相同' }, 400)
-		record = { id, type: 'folder-move', actorEmail: identity.email, createdAt, folderMove: { sourceFolder: body.folder, destFolder: body.destFolder } }
+		record = { id, type: 'folder-move', actorEmail: viewer.email, createdAt, folderMove: { sourceFolder: body.folder, destFolder: body.destFolder } }
 	}
 	else if (body.action === 'folder-create') {
 		if (!body.folder || !FOLDER_RE.test(body.folder))
 			return json({ error: '文件夹路径无效' }, 400)
-		record = { id, type: 'folder-create', actorEmail: identity.email, createdAt, folderCreate: { folder: body.folder } }
+		record = { id, type: 'folder-create', actorEmail: viewer.email, createdAt, folderCreate: { folder: body.folder } }
 	}
 	else if (body.action === 'folder-rename') {
 		if (!body.folder || !body.newFolder || !FOLDER_RE.test(body.folder) || !FOLDER_RE.test(body.newFolder))
 			return json({ error: '文件夹路径无效' }, 400)
 		if (body.folder === body.newFolder)
 			return json({ error: '新旧路径相同' }, 400)
-		record = { id, type: 'folder-rename', actorEmail: identity.email, createdAt, folderRename: { folder: body.folder, newFolder: body.newFolder } }
+		record = { id, type: 'folder-rename', actorEmail: viewer.email, createdAt, folderRename: { folder: body.folder, newFolder: body.newFolder } }
 	}
 	else {
 		return json({ error: '不支持的操作' }, 400)
 	}
 
 	await writePending(env, record)
-	// owner 自己的改动直接生效，不再进入待批准列表
-	if (isAdminIdentity(identity.email, env)) {
+	// 组织成员 / owner 自己的改动直接生效，不再进入待批准列表
+	if (viewer.autoApply) {
 		const execution = await executePendingRecord(env, record)
 		if (execution.error) {
 			if (record.upload)
@@ -854,8 +1199,8 @@ function storageImageName(originalName: string, mappedExtension: string): string
 }
 
 async function upload(request: Request, env: Env): Promise<Response> {
-	const identity = await requireIdentity(request, env)
-	if (!identity)
+	const viewer = await requireViewer(request, env)
+	if (!viewer)
 		return json({ error: '未登录：请先通过 Cloudflare Access 登录' }, 401)
 
 	let form: FormData
@@ -926,13 +1271,13 @@ async function upload(request: Request, env: Env): Promise<Response> {
 	const record: PendingRecord = {
 		id,
 		type: 'upload',
-		actorEmail: identity.email,
+		actorEmail: viewer.email,
 		createdAt: new Date().toISOString(),
 		upload: { stagedKey, finalKey, originalName: file.name, size: file.size, sha256: hash },
 	}
 	await writePending(env, record)
-	// owner 上传直接生效
-	if (isAdminIdentity(identity.email, env)) {
+	// 组织成员 / owner 上传直接生效
+	if (viewer.autoApply) {
 		const execution = await executePendingRecord(env, record)
 		if (execution.error) {
 			await env.IMAGES.delete(stagedKey)
@@ -983,13 +1328,18 @@ function articleFolder(input: string): string | null {
 }
 
 async function page(request: Request, env: Env): Promise<Response> {
-	const identity = await identityOf(request, env)
-	const email = identity.email ? `<span id="email">${escapeHtml(identity.email)}</span>` : '<span id="email">未登录（尚未启用 Access）</span>'
-	const isAdmin = isAdminIdentity(identity.email, env)
+	const viewer = await requireViewer(request, env)
+	const email = viewer
+		? `<span id="email">${escapeHtml(viewer.email)}</span> ${escapeHtml(roleLabel(viewer))}`
+		: '<span id="email">未登录（尚未启用 Access）</span>'
+	const canApprove = Boolean(viewer?.canApprove)
+	const driveHint = viewer && viewer.autoApply
+		? '进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。你的操作会直接生效；新建文件夹、移动、重命名、删除同样即时执行。'
+		: '进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。新建文件夹、移动、重命名、删除都会提交申请，owner 批准后才真正执行。'
 	const managementCard = `
 	<div class="card drive-card" id="driveCard">
 		<h2>图片库</h2>
-		<p class="drive-hint">进入目标目录后点“上传”，图片会存入当前目录；在“全部”上传时可选择目标文章，也支持把图片直接拖进来。新建文件夹、移动、重命名、删除都会提交申请，owner 批准后才真正执行。</p>
+		<p class="drive-hint">${driveHint}</p>
 		<div class="drive-toolbar">
 			<button type="button" id="driveUp">↑ 返回上级</button>
 			<div id="driveCrumbs" class="drive-crumbs"></div>
@@ -1049,9 +1399,9 @@ async function page(request: Request, env: Env): Promise<Response> {
 		</div>
 	</div>
 	<div id="driveContext" class="context-menu" hidden></div>`
-	const approvalCard = isAdmin ? `
+	const approvalCard = canApprove ? `
 	<div class="card">
-		<h2>待批准（owner）</h2>
+		<h2>待批准（组织 owner）</h2>
 		<div class="drive-toolbar approval-toolbar">
 			<button type="button" id="approvalSelectAll">全选</button>
 			<button type="button" id="approvalApproveAll">一键批准全部</button>
